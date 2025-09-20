@@ -93,3 +93,30 @@ def get_file_vt_score(cursor: sqlite3.Cursor, file_id: str) -> int | None:
     cursor.execute("SELECT vt_positives FROM files WHERE id = ?", (file_id,))
     result = cursor.fetchone()
     return result['vt_positives'] if result and result['vt_positives'] is not None else None
+
+# This new function goes at the end of app/db/dao.py
+
+def get_all_events_for_training() -> list[sqlite3.Row]:
+    """
+    Fetches all events and joins them with their corresponding file details
+    and user baseline information. This is the master query for ML training.
+    """
+    query = """
+        SELECT
+            e.*, -- all columns from events table
+            f.is_shared_externally,
+            f.vt_positives,
+            ub.typical_activity_hours_json
+        FROM
+            events e
+        LEFT JOIN
+            files f ON e.file_id = f.id
+        LEFT JOIN
+            user_baseline ub ON e.actor_user_id = ub.user_id
+        WHERE
+            e.actor_user_id IS NOT NULL
+    """
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(query)
+        return cursor.fetchall()

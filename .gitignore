@@ -1,10 +1,15 @@
-# Virtual Environment
+# Python virtual environment
 .venv/
 
-# Secrets
+# Secret credentials file
 client_secret.json
+
+# Secret API keys
 .env
 
-# Python cache
+# User-specific token file
+.argus/token.json
+
+# Python bytecode
 __pycache__/
 *.pyc

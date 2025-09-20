@@ -14,6 +14,7 @@ def main():
     parser.add_argument("--learn-baseline", action="store_true", help="Calculate user behavior.")
     parser.add_argument("--test-scoring", action="store_true", help="Display score analysis for recent events.")
     parser.add_argument("--scan-for-threats", action="store_true", help="Scan files against VirusTotal.")
+    parser.add_argument("--train-model",action="store_true",help="Train the ML anomaly detection model on all historical data.")
     # Removed the old --find-narratives as it's now part of --test-scoring
     args = parser.parse_args()
 
@@ -43,6 +44,10 @@ def main():
     elif args.scan_for_threats:
         from app.analysis.threat_scanner import scan_unscanned_files
         scan_unscanned_files()
+    
+    elif args.train_model:
+        from app.analysis.ml_trainer import train_model
+        train_model()
     
     else:
         print("\nNo action specified. Use --start-guardian or another command.")
