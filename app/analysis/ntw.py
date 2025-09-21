@@ -1,71 +1,80 @@
-# app/analysis/ntw.py (Final Version with Clear Normalization)
+# app/analysis/ntw.py (Final Version with Threat Escalation Framework)
 
 from app.db import dao
 from app.analysis.event_risk import calculate_event_risk_score
 from app.analysis.narrative_builder import analyze_narratives_for_file, analyze_mass_deletion_for_user
 from app.analysis.ml_risk import calculate_ml_risk_score
-from app.analysis.contextual_risk import calculate_contextual_risk_score
+from app.analysis.contextual_risk import calculate_contextual_risk_score # This import now works
 
-# --- RE-TUNED WEIGHTS ---
-WEIGHTS = { "NR": 0.35, "MR": 0.15, "ER": 0.30, "CR": 0.20 }
-
-# --- NEW: Define the "100% threat" score for each dimension for normalization ---
-# We've decided that a score of 25 represents a "100% threat" in any single category.
-# This makes the numbers consistent. For example, a mass deletion (raw score 20) is
-# an 80% threat on the Narrative scale (20 / 25).
-MAX_SCORE_PER_DIMENSION = 25.0
+# --- Define the bonus percentage for each amplifier ---
+AMPLIFIER_BONUS = {
+    "OFF_HOURS": 0.50,    # 50% score increase
+    "IS_DORMANT": 0.75, # 75% score increase
+    "IS_ARCHIVE": 0.25, # 25% score increase for .zip files etc.
+    "IS_ANOMALY": 1.00     # 100% score increase (doubles the score)
+}
 
 def get_final_threat_score(event: dict) -> dict:
     """
-    The main orchestrator, using clear normalization before applying weights.
+    The main orchestrator, implementing the Threat Escalation Framework.
     """
-    er_score, er_reasons = 0.0, []
-    nr_score, nr_reasons = 0.0, []
-    cr_score, cr_reasons = 0.0, []
-    mr_score, mr_reasons = 0.0, []
-
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
 
+        # --- Step 1: Gather Intelligence from all Specialists ---
         er_score, er_reasons = calculate_event_risk_score(cursor, event)
-        cr_score, cr_reasons = calculate_contextual_risk_score(cursor, event, er_score)
+        cr_score, cr_reasons = calculate_contextual_risk_score(cursor, event)
         mr_score, mr_reasons = calculate_ml_risk_score(cursor, event)
         
+        nr_score = 0.0
+        nr_reasons = []
         file_id = event.get('file_id')
         user_id = event.get('actor_user_id')
         if file_id:
             file_nr_score, file_nr_reasons = analyze_narratives_for_file(cursor, file_id)
             nr_score += file_nr_score
-            nr_reasons.extend(file_nr_reasons)
         if user_id:
-            user_nr_score, user_nr_reasons = analyze_mass_deletion_for_user(cursor, user_id)
+            user_nr_score, user_nr_reasons_user = analyze_mass_deletion_for_user(cursor, user_id)
             nr_score += user_nr_score
-            nr_reasons.extend(user_nr_reasons)
+            nr_reasons.extend(file_nr_reasons) # Combine file and user narratives
+            nr_reasons.extend(user_nr_reasons_user)
 
-    # --- NEW: Clear Normalization Step ---
-    # Convert each raw score to a 0-100 scale based on our defined maximum.
-    er_normalized = min(er_score / MAX_SCORE_PER_DIMENSION, 1.0) * 100
-    nr_normalized = min(nr_score / MAX_SCORE_PER_DIMENSION, 1.0) * 100
-    cr_normalized = min(cr_score / MAX_SCORE_PER_DIMENSION, 1.0) * 100
-    mr_normalized = min(mr_score / MAX_SCORE_PER_DIMENSION, 1.0) * 100
+
+    # --- Step 2: Determine the Primary Threat Vector ---
+    primary_threat_score = max(er_score, nr_score)
+    primary_threat_reasons = nr_reasons if nr_score > er_score else er_reasons
+
+    # --- Step 3: Identify Active Risk Amplifiers ---
+    total_amplification = 0.0
+    active_amplifiers = []
     
-    # Calculate the final weighted score from the 0-100 normalized scores
-    final_score = (
-        (er_normalized * WEIGHTS["ER"]) +
-        (nr_normalized * WEIGHTS["NR"]) +
-        (cr_normalized * WEIGHTS["CR"]) +
-        (mr_normalized * WEIGHTS["MR"])
-    )
-    
+    if "ER: Activity occurred outside of typical hours" in er_reasons:
+        total_amplification += AMPLIFIER_BONUS["OFF_HOURS"]
+        active_amplifiers.append(f"Amplified by Off-Hours Activity (+{AMPLIFIER_BONUS['OFF_HOURS'] * 100}%)")
+
+    # Check for contextual amplifiers
+    if "CR: Action on an old, dormant file" in cr_reasons:
+        total_amplification += AMPLIFIER_BONUS["IS_DORMANT"]
+        active_amplifiers.append(f"Amplified by Dormant File (+{AMPLIFIER_BONUS['IS_DORMANT'] * 100}%)")
+    if "CR: Event involves a compressed archive file" in cr_reasons:
+        total_amplification += AMPLIFIER_BONUS["IS_ARCHIVE"]
+        active_amplifiers.append(f"Amplified by Archive File (+{AMPLIFIER_BONUS['IS_ARCHIVE'] * 100}%)")
+
+    if mr_reasons:
+        total_amplification += AMPLIFIER_BONUS["IS_ANOMALY"]
+        active_amplifiers.append(f"Amplified by ML Anomaly Detection (+{AMPLIFIER_BONUS['IS_ANOMALY'] * 100}%)")
+
+    # --- Step 4: Calculate the Final Escalated Score ---
+    final_score = primary_threat_score * (1 + total_amplification)
+    final_score = min(final_score, 100.0)
+
     output = {
         "final_score": final_score,
         "threat_level": "Low",
         "breakdown": {
-            # We report the 0-100 normalized score for clarity
-            "ER": {"score": er_normalized, "weight": WEIGHTS["ER"], "reasons": er_reasons},
-            "NR": {"score": nr_normalized, "weight": WEIGHTS["NR"], "reasons": nr_reasons},
-            "CR": {"score": cr_normalized, "weight": WEIGHTS["CR"], "reasons": cr_reasons},
-            "MR": {"score": mr_normalized, "weight": WEIGHTS["MR"], "reasons": mr_reasons},
+            "primary_threat": {"score": primary_threat_score, "reasons": primary_threat_reasons},
+            "amplifiers": {"count": len(active_amplifiers), "reasons": active_amplifiers},
+            "calculation": f"{primary_threat_score:.2f} * (1 + {total_amplification:.2f}) = {final_score:.2f}"
         }
     }
 
@@ -75,12 +84,12 @@ def get_final_threat_score(event: dict) -> dict:
     
     return output
 
-# --- Update the Test Harness to show the 0-100 scale ---
 def test_scoring_harness():
-    print("\n--- Running Final Weighted NTW Framework Analysis ---")
+    # ... (The test harness code from the previous step is correct and does not need to change) ...
+    print("\n--- Running Threat Escalation Framework Analysis ---")
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT e.*, f.is_shared_externally, f.vt_positives, f.created_time, f.modified_time, ub.typical_activity_hours_json FROM events e LEFT JOIN files f ON e.file_id = f.id LEFT JOIN user_baseline ub ON e.actor_user_id = ub.user_id WHERE e.actor_user_id IS NOT NULL ORDER BY e.ts DESC LIMIT 3")
+        cursor.execute("SELECT e.*, f.name, f.is_shared_externally, f.vt_positives, f.created_time, f.modified_time, ub.typical_activity_hours_json FROM events e LEFT JOIN files f ON e.file_id = f.id LEFT JOIN user_baseline ub ON e.actor_user_id = ub.user_id WHERE e.actor_user_id IS NOT NULL ORDER BY e.ts DESC LIMIT 5")
         recent_events = cursor.fetchall()
 
         if not recent_events:
@@ -92,24 +101,19 @@ def test_scoring_harness():
             result = get_final_threat_score(event_dict)
             
             print("\n" + "="*60)
-            print(f"Scoring Event ID: {event_dict['id']} ({event_dict['event_type']})")
-            print(f"Final Weighted Score: {result['final_score']:.2f}/100 ({result['threat_level']})")
-            print("Breakdown (Normalized Score * Weight = Contribution):")
+            print(f"Scoring Event ID: {event_dict['id']} ({event_dict['event_type']}) on file '{event_dict.get('name', 'N/A')}'")
+            print(f"Final Escalated Score: {result['final_score']:.2f}/100 ({result['threat_level']})")
+            print("Breakdown:")
             
-            er = result['breakdown']['ER']
-            nr = result['breakdown']['NR']
-            cr = result['breakdown']['CR']
-            mr = result['breakdown']['MR']
+            primary = result['breakdown']['primary_threat']
+            amps = result['breakdown']['amplifiers']
             
-            print(f"  - Event Risk (ER):     {er['score']:.2f}/100 * {er['weight']} = {er['score']*er['weight']:.2f}")
-            for reason in er['reasons']: print(f"    - {reason}")
+            print(f"  - Primary Threat Score: {primary['score']:.2f}")
+            for reason in primary['reasons']: print(f"    - {reason}")
             
-            print(f"  - Narrative Risk (NR): {nr['score']:.2f}/100 * {nr['weight']} = {nr['score']*nr['weight']:.2f}")
-            for reason in nr['reasons']: print(f"    - {reason}")
-
-            print(f"  - Contextual Risk (CR):{cr['score']:.2f}/100 * {cr['weight']} = {cr['score']*cr['weight']:.2f}")
-            for reason in cr['reasons']: print(f"    - {reason}")
-
-            print(f"  - ML Risk (MR):        {mr['score']:.2f}/100 * {mr['weight']} = {mr['score']*mr['weight']:.2f}")
-            for reason in mr['reasons']: print(f"    - {reason}")
+            if amps['count'] > 0:
+                print(f"  - Risk Amplifiers ({amps['count']} found):")
+                for reason in amps['reasons']: print(f"    - {reason}")
+            
+            print(f"  - Final Calculation: {result['breakdown']['calculation']}")
     print("="*60)

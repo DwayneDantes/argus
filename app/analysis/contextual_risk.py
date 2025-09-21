@@ -1,38 +1,41 @@
-# app/analysis/contextual_risk.py (Corrected and Complete)
+# app/analysis/contextual_risk.py (Corrected for Final Architecture)
 
 from datetime import datetime, timedelta
 
-def calculate_contextual_risk_score(cursor, event: dict, initial_er_score: float) -> tuple[float, list[str]]:
+def calculate_contextual_risk_score(cursor, event: dict) -> tuple[float, list[str]]:
     """
-    Calculates the Contextual Risk (CR) by applying multipliers to the initial
-    Event Risk score.
+    Calculates the standalone Contextual Risk (CR) score.
+    Its job is to identify contextual risk factors.
     """
-    final_cr_score = initial_er_score
+    score = 0.0 # Start with zero; we only add score for specific findings.
     reasons = []
     
     event_type = event.get('event_type')
     file_id = event.get('file_id')
+    file_name = event.get('name', '')
 
-    if not file_id or event_type not in ['file_modified', 'file_shared_externally', 'file_trashed']:
-        return 0.0, []
+    # --- Context 1: Dormant File Activation ---
+    if file_id and event_type in ['file_modified', 'file_shared_externally', 'file_trashed']:
+        created_time_str = event.get('created_time')
+        modified_time_str = event.get('modified_time')
 
-    cursor.execute("SELECT created_time, modified_time FROM files WHERE id = ?", (file_id,))
-    file_times = cursor.fetchone()
+        if created_time_str and modified_time_str:
+            now = datetime.now()
+            created_dt = datetime.fromisoformat(created_time_str.replace('Z', ''))
+            last_modified_dt = datetime.fromisoformat(modified_time_str.replace('Z', ''))
 
-    if not file_times:
-        return 0.0, []
+            is_old_file = (now - created_dt) > timedelta(days=365)
+            is_dormant = (now - last_modified_dt) > timedelta(days=180)
 
-    now = datetime.now()
-    created_dt = datetime.fromisoformat(file_times['created_time'])
-    last_modified_dt = datetime.fromisoformat(file_times['modified_time'])
+            if is_old_file and is_dormant:
+                # This is a significant contextual finding.
+                score += 7.0
+                reasons.append("CR: Action on an old, dormant file")
 
-    is_old_file = (now - created_dt) > timedelta(days=365)
-    is_dormant = (now - last_modified_dt) > timedelta(days=180)
-
-    if is_old_file and is_dormant:
-        final_cr_score *= 2.0
-        reasons.append("CR Multiplier: Action on a dormant file")
-
-    contextual_risk_added = final_cr_score - initial_er_score
+    # --- Context 2: Suspicious Bundling ---
+    if event_type in ['file_created', 'file_copied', 'file_shared_externally']:
+        if any(file_name.lower().endswith(ext) for ext in ['.zip', '.rar', '.7z']):
+            score += 4.0
+            reasons.append("CR: Event involves a compressed archive file")
     
-    return contextual_risk_added, reasons
+    return score, reasons
