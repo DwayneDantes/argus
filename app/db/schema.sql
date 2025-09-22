@@ -1,7 +1,8 @@
--- app/db/schema.sql
+-- app/db/schema.sql (Corrected Comments)
 
 PRAGMA foreign_keys=ON;
 
+-- meta table is unchanged
 CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT NOT NULL );
 
 CREATE TABLE IF NOT EXISTS files (
@@ -15,13 +16,13 @@ CREATE TABLE IF NOT EXISTS files (
   md5Checksum TEXT,
   vt_scan_ts TEXT,
   vt_positives INTEGER,
-  -- --- ADDED FOR DATA EXFILTRATION DETECTION ---
-  is_shared_externally INTEGER DEFAULT 0 -- 0 for false, 1 for true
+  is_shared_externally INTEGER DEFAULT 0,
+  is_shared_publicly INTEGER DEFAULT 0 -- ADDED
 );
 
 CREATE INDEX IF NOT EXISTS idx_files_md5Checksum ON files(md5Checksum);
 
--- (The rest of the tables: users, events, narratives, etc., are unchanged)
+-- rest of tables are unchanged
 CREATE TABLE IF NOT EXISTS users ( id TEXT PRIMARY KEY, display_name TEXT, email TEXT );
 CREATE TABLE IF NOT EXISTS events ( id INTEGER PRIMARY KEY AUTOINCREMENT, drive_change_id TEXT UNIQUE NOT NULL, file_id TEXT, event_type TEXT NOT NULL, actor_user_id TEXT, ts TEXT NOT NULL, details_json TEXT, FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE SET NULL, FOREIGN KEY (actor_user_id) REFERENCES users(id) ON DELETE SET NULL );
 CREATE TABLE IF NOT EXISTS narratives ( id INTEGER PRIMARY KEY AUTOINCREMENT, start_ts TEXT NOT NULL, end_ts TEXT NOT NULL, threat_score REAL NOT NULL, summary TEXT );

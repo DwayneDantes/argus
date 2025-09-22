@@ -27,33 +27,36 @@ except Exception as e:
 
 def calculate_ml_risk_score(cursor, event: dict) -> tuple[float, list[str]]:
     """
-    Calculates the Machine Learning Risk (MR) score for an event using the
-    pre-trained Isolation Forest model.
+    Calculates a nuanced Machine Learning Risk (MR) score using the
+    pre-trained Isolation Forest model's anomaly score.
     """
     score = 0.0
     reasons = []
 
-    # If the model failed to load, we can't score.
     if model is None:
         return score, reasons
 
-    # 1. Get the necessary data for featurization.
-    # The event dictionary already contains most of what we need from the join.
     baseline = event
     file_details = event
-
-    # 2. Convert the event into a numerical feature vector.
-    # It MUST be the same format as the data used for training.
     feature_vector = featurize_event(event, baseline, file_details)
     
-    # 3. Use the model to predict.
-    # The model expects a list of samples, so we wrap our vector in a list.
-    # The .predict() method returns -1 for anomalies and 1 for normal data points.
-    prediction = model.predict([feature_vector])
+    # --- UPGRADED LOGIC ---
+    # 1. Use .score_samples() to get a raw anomaly score.
+    # The method returns a score where more negative = more normal.
+    # We flip the sign so that positive = more anomalous.
+    raw_anomaly_score = -model.score_samples([feature_vector])[0]
 
-    # 4. Translate the prediction into a score.
-    if prediction[0] == -1: # -1 signifies an anomaly
-        score = 25.0 # Assign the maximum possible score for this dimension
-        reasons.append("MR: ML model detected a significant behavioral anomaly")
-
+    # 2. Normalize and translate the raw score into our 0-25 point system.
+    # These thresholds are a starting point and would be refined with testing.
+    # A typical "normal" score is around 0.5. Anything higher is an anomaly.
+    if raw_anomaly_score > 0.6: # Critical anomaly
+        score = 25.0
+        reasons.append(f"MR: ML model detected a CRITICAL behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
+    elif raw_anomaly_score > 0.55: # High anomaly
+        score = 18.0
+        reasons.append(f"MR: ML model detected a HIGH behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
+    elif raw_anomaly_score > 0.52: # Medium anomaly
+        score = 10.0
+        reasons.append(f"MR: ML model detected a MODERATE behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
+    
     return score, reasons

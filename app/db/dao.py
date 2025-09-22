@@ -1,11 +1,10 @@
 # app/db/dao.py
-
 import sqlite3
 from pathlib import Path
 import json
 from datetime import datetime
 
-# ... (All other functions are unchanged) ...
+# ... (all other functions are unchanged until get_file_details) ...
 APP_DIR = Path.home() / ".argus"
 DB_FILE = APP_DIR / "argus.db"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
@@ -40,10 +39,11 @@ def set_meta_value(key: str, value: str):
 
 # --- UPDATED FUNCTION ---
 def get_file_details(cursor: sqlite3.Cursor, file_id: str) -> sqlite3.Row | None:
-    """Retrieves key details of a file, now including sharing status."""
-    cursor.execute("SELECT id, name, parents_json, modified_time, is_shared_externally FROM files WHERE id = ?", (file_id,))
+    """Retrieves key details, now including both sharing flags."""
+    cursor.execute("SELECT id, name, parents_json, modified_time, is_shared_externally, is_shared_publicly FROM files WHERE id = ?", (file_id,))
     return cursor.fetchone()
 
+# ... (find_file_by_checksum and save_user are unchanged) ...
 def find_file_by_checksum(cursor: sqlite3.Cursor, checksum: str, new_file_id: str) -> sqlite3.Row | None:
     cursor.execute( "SELECT id, name FROM files WHERE md5Checksum = ? AND id != ?", (checksum, new_file_id) )
     return cursor.fetchone()
@@ -52,23 +52,24 @@ def save_user(cursor: sqlite3.Cursor, user_data: dict):
     cursor.execute( "INSERT OR REPLACE INTO users (id, display_name, email) VALUES (?, ?, ?)", (user_data.get('permissionId'), user_data.get('displayName'), user_data.get('emailAddress')))
 
 # --- UPDATED FUNCTION ---
-def save_file(cursor: sqlite3.Cursor, file_data: dict, is_externally_shared: bool):
-    """Saves or updates a file's metadata, now including its sharing status."""
+def save_file(cursor: sqlite3.Cursor, file_data: dict, is_externally_shared: bool, is_publicly_shared: bool):
+    """Saves file metadata, including both new sharing flags."""
     parents_json = json.dumps(file_data.get('parents', []))
     cursor.execute(
-        "INSERT OR REPLACE INTO files (id, name, mime_type, created_time, modified_time, trashed, parents_json, md5Checksum, is_shared_externally) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO files (id, name, mime_type, created_time, modified_time, trashed, parents_json, md5Checksum, is_shared_externally, is_shared_publicly) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             file_data.get('id'), file_data.get('name'), file_data.get('mimeType'),
             file_data.get('createdTime'), file_data.get('modifiedTime'),
             1 if file_data.get('trashed') else 0, parents_json,
-            file_data.get('md5Checksum'), 1 if is_externally_shared else 0
+            file_data.get('md5Checksum'), 1 if is_externally_shared else 0,
+            1 if is_publicly_shared else 0
         )
     )
 
+# ... (rest of DAO is unchanged) ...
 def save_event(cursor: sqlite3.Cursor, change_id: str, file_id: str, event_type: str, actor_id: str | None, timestamp: str, details: str):
     cursor.execute( "INSERT OR IGNORE INTO events (drive_change_id, file_id, event_type, actor_user_id, ts, details_json) VALUES (?, ?, ?, ?, ?, ?)", (change_id, file_id, event_type, actor_id, timestamp, details))
 
-# ... (The rest of the DAO functions for baselining and VT scanning are unchanged) ...
 def get_user_baseline(cursor: sqlite3.Cursor, user_id: str) -> sqlite3.Row | None:
     cursor.execute("SELECT * FROM user_baseline WHERE user_id = ?", (user_id,))
     return cursor.fetchone()
@@ -94,29 +95,4 @@ def get_file_vt_score(cursor: sqlite3.Cursor, file_id: str) -> int | None:
     result = cursor.fetchone()
     return result['vt_positives'] if result and result['vt_positives'] is not None else None
 
-# This new function goes at the end of app/db/dao.py
 
-def get_all_events_for_training() -> list[sqlite3.Row]:
-    """
-    Fetches all events and joins them with their corresponding file details
-    and user baseline information. This is the master query for ML training.
-    """
-    query = """
-        SELECT
-            e.*, -- all columns from events table
-            f.is_shared_externally,
-            f.vt_positives,
-            ub.typical_activity_hours_json
-        FROM
-            events e
-        LEFT JOIN
-            files f ON e.file_id = f.id
-        LEFT JOIN
-            user_baseline ub ON e.actor_user_id = ub.user_id
-        WHERE
-            e.actor_user_id IS NOT NULL
-    """
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute(query)
-        return cursor.fetchall()
