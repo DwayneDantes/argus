@@ -95,4 +95,38 @@ def get_file_vt_score(cursor: sqlite3.Cursor, file_id: str) -> int | None:
     result = cursor.fetchone()
     return result['vt_positives'] if result and result['vt_positives'] is not None else None
 
+def count_recent_user_activity(cursor: sqlite3.Cursor, user_id: str, end_ts_str: str, window_minutes: int = 10) -> int:
+    """
+    Counts the total number of events for a user in a given time window
+    leading up to a specific event.
+    """
+    query = f"""
+        SELECT COUNT(*) as event_count
+        FROM events
+        WHERE
+            actor_user_id = ?
+            AND ts <= ?
+            AND ts >= datetime(?, '-{window_minutes} minutes')
+    """
+    cursor.execute(query, (user_id, end_ts_str, end_ts_str))
+    result = cursor.fetchone()
+    return result['event_count'] if result else 0
 
+def get_priority_unscanned_files(cursor: sqlite3.Cursor, limit: int = 5) -> list[sqlite3.Row]:
+    """
+    Retrieves a small batch of the MOST RECENTLY CREATED files that have
+    a checksum but have never been scanned. This is the priority queue.
+    """
+    # We look for unscanned files created in the last day and order them
+    # so the newest ones are first.
+    query = """
+        SELECT id, md5Checksum FROM files
+        WHERE
+            md5Checksum IS NOT NULL
+            AND vt_scan_ts IS NULL
+            AND created_time >= datetime('now', '-1 day')
+        ORDER BY created_time DESC
+        LIMIT ?
+    """
+    cursor.execute(query, (limit,))
+    return cursor.fetchall()

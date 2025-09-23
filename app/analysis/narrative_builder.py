@@ -1,6 +1,8 @@
 # app/analysis/narrative_builder.py (Refactored for Scoring)
 
+from datetime import datetime, timedelta
 from app.db import dao
+import re
 # We no longer use the old scoring function here
 # from app.analysis.ntw import calculate_threat_score 
 
@@ -9,7 +11,9 @@ from app.db import dao
 # This score can be augmented by the individual Event Risk scores of its component events.
 NARRATIVE_BASE_SCORES = {
     'data_exfiltration': 15.0,
-    'mass_deletion': 20.0
+    'mass_deletion': 20.0,
+    # --- ADDED: The new high-impact narrative ---
+    'ransomware_footprint': 25.0 # Assign a very high base score
 }
 
 def analyze_narratives_for_file(cursor, file_id: str) -> tuple[float, list[str]]:
@@ -95,3 +99,59 @@ def analyze_mass_deletion_for_user(cursor, user_id: str) -> tuple[float, list[st
             detected_narratives.append(reason)
 
     return total_score, detected_narratives
+
+def analyze_ransomware_footprint(cursor, user_id: str, event_ts_str: str) -> tuple[float, list[str]]:
+    """
+    Analyzes a 1-hour window around a given event for the specific
+    pattern of a ransomware attack.
+    """
+    score = 0.0
+    reasons = []
+
+    # --- THIS IS THE CORRECTED LOGIC ---
+    # Define a 1-hour window for the analysis based on the single event timestamp
+    event_dt = datetime.fromisoformat(event_ts_str.replace('Z',''))
+    start_ts = (event_dt - timedelta(minutes=30)).isoformat()
+    end_ts = (event_dt + timedelta(minutes=30)).isoformat()
+    
+    ransomware_ext_pattern = r'\.(locked|crypted|encrypted|kraken|onion|\[\w+\])$'
+    ransom_note_pattern = r'^(readme|recover|decrypt|help).*\.(txt|html)$'
+
+    cursor.execute("""
+        SELECT file_id, event_type, name FROM events e
+        LEFT JOIN files f ON e.file_id = f.id
+        WHERE e.actor_user_id = ? AND e.ts >= ? AND e.ts <= ?
+    """, (user_id, start_ts, end_ts))
+    activity_window = cursor.fetchall()
+
+    if not activity_window:
+        return 0.0, []
+
+    modified_files = set()
+    renamed_to_ransom_ext = set()
+    ransom_note_found = False
+
+    for event in activity_window:
+        if event['event_type'] == 'file_modified':
+            modified_files.add(event['file_id'])
+        elif event['event_type'] == 'file_renamed' and event['name']:
+            if re.search(ransomware_ext_pattern, event['name'], re.IGNORECASE):
+                renamed_to_ransom_ext.add(event['file_id'])
+        elif event['event_type'] == 'file_created' and event['name']:
+            if re.search(ransom_note_pattern, event['name'], re.IGNORECASE):
+                ransom_note_found = True
+
+    points = 0
+    encrypted_files_count = len(modified_files.intersection(renamed_to_ransom_ext))
+
+    if encrypted_files_count > 5:
+        points += 15
+        reasons.append(f"NR: Detected {encrypted_files_count} files modified then renamed to a ransom extension.")
+    if ransom_note_found:
+        points += 10
+        reasons.append("NR: A file matching a common ransom note name was also created.")
+
+    if points >= 15:
+        score = NARRATIVE_BASE_SCORES['ransomware_footprint']
+    
+    return score, reasons
