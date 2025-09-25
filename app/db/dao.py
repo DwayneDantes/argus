@@ -1,10 +1,9 @@
-# app/db/dao.py
+# app/db/dao.py (CORRECTED with proper connection handling)
 import sqlite3
 from pathlib import Path
 import json
 from datetime import datetime
 
-# ... (all other functions are unchanged until get_file_details) ...
 APP_DIR = Path.home() / ".argus"
 DB_FILE = APP_DIR / "argus.db"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
@@ -24,26 +23,23 @@ def initialize_database():
         conn.commit()
     print("Database ready.")
 
-def get_meta_value(key: str) -> str | None:
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
-        row = cursor.fetchone()
-        return row['value'] if row else None
+# --- REFACTORED FUNCTION ---
+def get_meta_value(cursor: sqlite3.Cursor, key: str) -> str | None:
+    """Gets a meta value using the provided database cursor."""
+    cursor.execute("SELECT value FROM meta WHERE key = ?", (key,))
+    row = cursor.fetchone()
+    return row['value'] if row else None
 
-def set_meta_value(key: str, value: str):
-    with get_db_connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
-        conn.commit()
+# --- REFACTORED FUNCTION ---
+def set_meta_value(cursor: sqlite3.Cursor, key: str, value: str):
+    """Sets a meta value using the provided database cursor."""
+    cursor.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-# --- UPDATED FUNCTION ---
+# --- All functions below this line are unchanged, until get_all_events_for_ml_training ---
 def get_file_details(cursor: sqlite3.Cursor, file_id: str) -> sqlite3.Row | None:
-    """Retrieves key details, now including both sharing flags."""
     cursor.execute("SELECT id, name, parents_json, modified_time, is_shared_externally, is_shared_publicly FROM files WHERE id = ?", (file_id,))
     return cursor.fetchone()
 
-# ... (find_file_by_checksum and save_user are unchanged) ...
 def find_file_by_checksum(cursor: sqlite3.Cursor, checksum: str, new_file_id: str) -> sqlite3.Row | None:
     cursor.execute( "SELECT id, name FROM files WHERE md5Checksum = ? AND id != ?", (checksum, new_file_id) )
     return cursor.fetchone()
@@ -51,9 +47,7 @@ def find_file_by_checksum(cursor: sqlite3.Cursor, checksum: str, new_file_id: st
 def save_user(cursor: sqlite3.Cursor, user_data: dict):
     cursor.execute( "INSERT OR REPLACE INTO users (id, display_name, email) VALUES (?, ?, ?)", (user_data.get('permissionId'), user_data.get('displayName'), user_data.get('emailAddress')))
 
-# --- UPDATED FUNCTION ---
 def save_file(cursor: sqlite3.Cursor, file_data: dict, is_externally_shared: bool, is_publicly_shared: bool):
-    """Saves file metadata, including both new sharing flags."""
     parents_json = json.dumps(file_data.get('parents', []))
     cursor.execute(
         "INSERT OR REPLACE INTO files (id, name, mime_type, created_time, modified_time, trashed, parents_json, md5Checksum, is_shared_externally, is_shared_publicly) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -66,7 +60,6 @@ def save_file(cursor: sqlite3.Cursor, file_data: dict, is_externally_shared: boo
         )
     )
 
-# ... (rest of DAO is unchanged) ...
 def save_event(cursor: sqlite3.Cursor, change_id: str, file_id: str, event_type: str, actor_id: str | None, timestamp: str, details: str):
     cursor.execute( "INSERT OR IGNORE INTO events (drive_change_id, file_id, event_type, actor_user_id, ts, details_json) VALUES (?, ?, ?, ?, ?, ?)", (change_id, file_id, event_type, actor_id, timestamp, details))
 
@@ -96,37 +89,43 @@ def get_file_vt_score(cursor: sqlite3.Cursor, file_id: str) -> int | None:
     return result['vt_positives'] if result and result['vt_positives'] is not None else None
 
 def count_recent_user_activity(cursor: sqlite3.Cursor, user_id: str, end_ts_str: str, window_minutes: int = 10) -> int:
-    """
-    Counts the total number of events for a user in a given time window
-    leading up to a specific event.
-    """
     query = f"""
-        SELECT COUNT(*) as event_count
-        FROM events
-        WHERE
-            actor_user_id = ?
-            AND ts <= ?
-            AND ts >= datetime(?, '-{window_minutes} minutes')
+        SELECT COUNT(*) as event_count FROM events WHERE actor_user_id = ? AND ts <= ? AND ts >= datetime(?, '-{window_minutes} minutes')
     """
     cursor.execute(query, (user_id, end_ts_str, end_ts_str))
     result = cursor.fetchone()
     return result['event_count'] if result else 0
 
 def get_priority_unscanned_files(cursor: sqlite3.Cursor, limit: int = 5) -> list[sqlite3.Row]:
-    """
-    Retrieves a small batch of the MOST RECENTLY CREATED files that have
-    a checksum but have never been scanned. This is the priority queue.
-    """
-    # We look for unscanned files created in the last day and order them
-    # so the newest ones are first.
     query = """
-        SELECT id, md5Checksum FROM files
-        WHERE
-            md5Checksum IS NOT NULL
-            AND vt_scan_ts IS NULL
-            AND created_time >= datetime('now', '-1 day')
-        ORDER BY created_time DESC
-        LIMIT ?
+        SELECT id, md5Checksum FROM files WHERE md5Checksum IS NOT NULL AND vt_scan_ts IS NULL AND created_time >= datetime('now', '-1 day')
+        ORDER BY created_time DESC LIMIT ?
     """
     cursor.execute(query, (limit,))
     return cursor.fetchall()
+
+# --- REFACTORED FUNCTION ---
+def get_all_events_for_ml_training(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
+    """
+    Fetches all events and joins them with all necessary data from other tables
+    required for the ML featurizer, using the provided database cursor.
+    """
+    query = """
+        SELECT
+            e.*, f.name, f.mime_type, f.is_shared_externally, f.is_shared_publicly,
+            f.vt_positives, f.created_time, f.modified_time, ub.typical_activity_hours_json
+        FROM events e
+        LEFT JOIN files f ON e.file_id = f.id
+        LEFT JOIN user_baseline ub ON e.actor_user_id = ub.user_id
+        WHERE e.actor_user_id IS NOT NULL
+    """
+    cursor.execute(query)
+    return cursor.fetchall()
+    
+def find_file_by_name(cursor: sqlite3.Cursor, file_name: str) -> sqlite3.Row | None:
+    cursor.execute("SELECT id, name, md5Checksum FROM files WHERE name = ?", (file_name,))
+    return cursor.fetchone()
+
+def update_event_analysis_status(cursor: sqlite3.Cursor, event_id: int, status: int):
+    """Marks an event as analyzed or un-analyzed."""
+    cursor.execute("UPDATE events SET is_analyzed = ? WHERE id = ?", (status, event_id))

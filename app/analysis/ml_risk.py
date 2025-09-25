@@ -5,6 +5,7 @@ from pathlib import Path
 
 from app.db import dao
 from app.analysis.ml_featurizer import featurize_event
+from app import config
 
 # Define the path to the saved model
 MODEL_DIR = Path.home() / ".argus"
@@ -25,38 +26,33 @@ except Exception as e:
     print(f"ERROR: Could not load the ML model. MR score will be 0. Error: {e}")
 
 
-def calculate_ml_risk_score(cursor, event: dict) -> tuple[float, list[str]]:
+def calculate_ml_risk_score(cursor, event: dict) -> tuple[float, list[str], list[str]]:
     """
-    Calculates a nuanced Machine Learning Risk (MR) score using the
-    pre-trained Isolation Forest model's anomaly score.
+    Calculates ML Risk (MR) score and returns structured tags.
     """
     score = 0.0
     reasons = []
+    tags = []
 
     if model is None:
-        return score, reasons
+        return score, reasons, tags
 
-    baseline = event
-    file_details = event
-    feature_vector = featurize_event(event, baseline, file_details)
-    
-    # --- UPGRADED LOGIC ---
-    # 1. Use .score_samples() to get a raw anomaly score.
-    # The method returns a score where more negative = more normal.
-    # We flip the sign so that positive = more anomalous.
+    # ... (featurizing is the same) ...
+    baseline = event; file_details = event; feature_vector = featurize_event(event, baseline, file_details)
     raw_anomaly_score = -model.score_samples([feature_vector])[0]
 
-    # 2. Normalize and translate the raw score into our 0-25 point system.
-    # These thresholds are a starting point and would be refined with testing.
-    # A typical "normal" score is around 0.5. Anything higher is an anomaly.
-    if raw_anomaly_score > 0.6: # Critical anomaly
-        score = 25.0
+    # --- Use constants from the config file ---
+    if raw_anomaly_score > config.ML_ANOMALY_THRESHOLDS["CRITICAL"]:
+        score = config.ML_RISK_SCORES["CRITICAL"]
         reasons.append(f"MR: ML model detected a CRITICAL behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
-    elif raw_anomaly_score > 0.55: # High anomaly
-        score = 18.0
+        tags.append("ML_CRITICAL_ANOMALY")
+    elif raw_anomaly_score > config.ML_ANOMALY_THRESHOLDS["HIGH"]:
+        score = config.ML_RISK_SCORES["HIGH"]
         reasons.append(f"MR: ML model detected a HIGH behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
-    elif raw_anomaly_score > 0.52: # Medium anomaly
-        score = 10.0
+        tags.append("ML_HIGH_ANOMALY")
+    elif raw_anomaly_score > config.ML_ANOMALY_THRESHOLDS["MODERATE"]:
+        score = config.ML_RISK_SCORES["MODERATE"]
         reasons.append(f"MR: ML model detected a MODERATE behavioral anomaly (raw score: {raw_anomaly_score:.3f})")
+        tags.append("ML_MODERATE_ANOMALY")
     
-    return score, reasons
+    return score, reasons, tags

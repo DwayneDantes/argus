@@ -1,12 +1,13 @@
-# app/drive/ingest.py (Definitive Hierarchical Logic)
+# app/drive/ingest.py (REFACTORED with Hybrid Activity API)
+
 import json
+from datetime import datetime, timezone, timedelta
 from googleapiclient.discovery import build
-# ... (rest of imports)
 from googleapiclient.errors import HttpError
 from google.oauth2.credentials import Credentials
 from app.db import dao
 
-# (The helper functions are unchanged)
+# --- Helper functions (unchanged) ---
 def is_publicly_shared(permissions: list) -> bool:
     if not permissions: return False
     for perm in permissions:
@@ -23,103 +24,110 @@ def is_externally_shared(permissions: list, user_email: str) -> bool:
             if email and user_domain not in email: return True
     return False
 
+# --- THE NEW, HYBRID INGESTION ENGINE ---
+# Replace ONLY this function in app/drive/ingest.py (FINAL CORRECTED VERSION)
+
 def ingest_once(creds: Credentials):
-    # (The setup logic is unchanged)
-    print("\n--- Starting Data Ingestion ---")
-    service = build('drive', 'v3', credentials=creds)
-    user_info = service.about().get(fields="user").execute()
-    user_email = user_info['user']['emailAddress']
-    page_token = dao.get_meta_value('startPageToken')
-    if not page_token:
-        response = service.changes().getStartPageToken().execute()
-        page_token = response.get('startPageToken')
+    print("\n--- Starting Hybrid Data Ingestion (Activity API + Changes API) ---")
     
+    drive_v3_service = build('drive', 'v3', credentials=creds)
+    activity_v2_service = build('driveactivity', 'v2', credentials=creds)
+    
+    user_info = drive_v3_service.about().get(fields="user").execute()
+    user_email = user_info['user']['emailAddress']
+
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
-        checksum_cache = {}
-        while page_token is not None:
-            response = service.changes().list(pageToken=page_token, spaces='drive', fields='nextPageToken, newStartPageToken, changes(fileId, time)').execute()
-            changes = response.get('changes', [])
-            if not changes: print("No new changes found.")
-            else:
-                print(f"Found {len(changes)} new changes to process.")
-                for change in changes:
-                    # (Setup in loop is unchanged)
-                    file_id = change.get('fileId')
-                    change_time = change.get('time')
-                    change_id = f"{file_id}-{change_time}"
-                    
+
+        print("\n[Phase 1] Querying Drive Activity API for definitive events...")
+        # --- FIX: Pass the cursor to the DAO function ---
+        last_ingest_ts = dao.get_meta_value(cursor, 'last_activity_timestamp')
+        if not last_ingest_ts:
+            last_ingest_ts = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            print(f"No previous timestamp found. Starting from {last_ingest_ts}")
+
+        timestamp_ms = int(datetime.fromisoformat(last_ingest_ts).timestamp() * 1000)
+        request = { 'filter': f"time > {timestamp_ms}" }
+        
+        # ... (The entire middle section of the function remains the same) ...
+        activities_processed = 0
+        while True:
+            try:
+                # Removed debug print for cleaner output
+                response = activity_v2_service.activity().query(body=request).execute()
+                activities = response.get('activities', [])
+                for activity in activities:
+                    # (all the event processing logic is unchanged)
+                    event_type = None; primary_action = activity.get('primaryActionDetail', {}); target = activity.get('targets', [{}])[0].get('driveItem', {}); file_id = target.get('name', '').replace('items/', ''); actor = activity.get('actors', [{}])[0]; actor_id = actor.get('user', {}).get('knownUser', {}).get('personName', '').replace('people/', ''); raw_timestamp = activity.get('timestamp') or activity.get('timeRange', {}).get('endTime')
+                    if not raw_timestamp: continue
                     try:
-                        fields = "id, name, mimeType, createdTime, modifiedTime, trashed, parents, lastModifyingUser, md5Checksum, permissions"
-                        file_metadata = service.files().get(fileId=file_id, fields=fields).execute()
-                        
-                        event_type = None
-                        permissions = file_metadata.get('permissions', [])
-                        is_shared_now = is_externally_shared(permissions, user_email)
-                        is_public_now = is_publicly_shared(permissions)
+                        if isinstance(raw_timestamp, str) and 'Z' in raw_timestamp: event_dt = datetime.fromisoformat(raw_timestamp.replace('Z', '+00:00'))
+                        else: event_dt = datetime.fromtimestamp(int(raw_timestamp) / 1000000, tz=timezone.utc)
+                        event_ts = event_dt.isoformat()
+                    except (ValueError, TypeError): continue
+                    change_id = f"activity-{file_id}-{raw_timestamp}"
+                    if 'create' in primary_action:
+                        if 'copy' in primary_action['create']: event_type = "file_copied"
+                        else: event_type = "file_created"
+                    elif 'edit' in primary_action: event_type = "file_modified"
+                    elif 'delete' in primary_action: event_type = "file_trashed"
+                    elif 'rename' in primary_action: event_type = "file_renamed"
+                    elif 'move' in primary_action: event_type = "file_moved"
+                    elif 'permissionChange' in primary_action: event_type = "file_shared_externally"
+                    if event_type and file_id:
+                        try:
+                            fields = "id, name, mimeType, createdTime, modifiedTime, trashed, parents, lastModifyingUser, md5Checksum, permissions"; file_metadata = drive_v3_service.files().get(fileId=file_id, fields=fields).execute(); permissions = file_metadata.get('permissions', []); is_shared_now = is_externally_shared(permissions, user_email); is_public_now = is_publicly_shared(permissions)
+                            if actor_id: dao.save_user(cursor, {'permissionId': actor_id, 'displayName': 'Unknown (from Activity API)', 'emailAddress': None})
+                            dao.save_file(cursor, file_metadata, is_shared_now, is_public_now); dao.save_event(cursor, change_id, file_id, event_type, actor_id, event_ts, json.dumps(file_metadata)); print(f"  - [Activity API] Stored Event: '{event_type}' for '{file_metadata.get('name')}'"); activities_processed += 1
+                        except HttpError as e:
+                            if e.resp.status == 404: event_type = "file_deleted_permanently"; dao.save_event(cursor, change_id, file_id, event_type, actor_id, event_ts, '{}'); print(f"  - [Activity API] Stored Event: '{event_type}' for file {file_id}")
+                            else: print(f"  - Could not process file {file_id} from activity: {e}")
+                request['pageToken'] = response.get('nextPageToken')
+                if not request['pageToken']: break
+            except HttpError as error: print(f"\n[ERROR] An HTTP error occurred with the Activity API: {error.content}"); break
+        if activities_processed == 0: print("No new activities found.")
+        
+        # --- FIX: Pass the cursor to the DAO function ---
+        dao.set_meta_value(cursor, "last_activity_timestamp", datetime.now(timezone.utc).isoformat())
+        conn.commit()
 
-                        previous_details = dao.get_file_details(cursor, file_id)
-
-                        # --- THIS IS THE NEW, CORRECT HIERARCHICAL LOGIC ---
-                        if file_metadata.get('trashed'):
-                            event_type = "file_trashed"
-                        elif not previous_details:
-                            # New file logic is unchanged
-                            checksum = file_metadata.get('md5Checksum')
-                            if checksum and (dao.find_file_by_checksum(cursor, checksum, file_id) or checksum in checksum_cache):
-                                event_type = "file_copied"
-                            else:
-                                event_type = "file_created"
-                        else:
-                            # Logic for existing files, ordered by priority
-                            was_public_before = previous_details['is_shared_publicly'] == 1
-                            was_shared_before = previous_details['is_shared_externally'] == 1
-
-                            if not was_public_before and is_public_now:
-                                event_type = "file_made_public" # HIGHEST priority change
-                            elif not was_shared_before and is_shared_now:
-                                event_type = "file_shared_externally"
-                            elif json.dumps(file_metadata.get('parents', [])) != previous_details['parents_json']:
-                                event_type = "file_moved"
-                            elif file_metadata.get('name') != previous_details['name']:
-                                event_type = "file_renamed"
-                            elif file_metadata.get('modifiedTime') != previous_details['modified_time']:
-                                event_type = "file_modified"
-                            else:
-                                event_type = "permission_change_internal" # Lowest priority
-
+        print("\n[Phase 2] Querying Changes API for moves/renames...")
+        # --- FIX: Pass the cursor to the DAO function ---
+        page_token = dao.get_meta_value(cursor, 'startPageToken')
+        if not page_token:
+            response = drive_v3_service.changes().getStartPageToken().execute()
+            page_token = response.get('startPageToken')
+        
+        # ... (Phase 2 logic continues) ...
+        changes_processed = 0
+        while page_token is not None:
+            response = drive_v3_service.changes().list(pageToken=page_token, spaces='drive', fields='nextPageToken, newStartPageToken, changes(fileId, time)').execute(); changes = response.get('changes', [])
+            for change in changes:
+                file_id = change.get('fileId'); change_time = change.get('time'); change_id = f"v3change-{file_id}-{change_time}"
+                try:
+                    fields = "id, name, mimeType, modifiedTime, trashed, parents"; file_metadata = drive_v3_service.files().get(fileId=file_id, fields=fields).execute(); event_type = None; previous_details = dao.get_file_details(cursor, file_id)
+                    if previous_details:
+                        if json.dumps(file_metadata.get('parents', [])) != previous_details['parents_json']: event_type = "file_moved"
+                        elif file_metadata.get('name') != previous_details['name']: event_type = "file_renamed"
                         if event_type:
-                            # (Saving logic is almost the same, just pass the new public flag)
-                            if file_metadata.get('md5Checksum'):
-                                checksum_cache[file_metadata['md5Checksum']] = {'id': file_id, 'name': file_metadata.get('name')}
-                            actor = file_metadata.get('lastModifyingUser')
-                            actor_id = actor.get('permissionId') if actor else None
-                            if actor: dao.save_user(cursor, actor)
-                            dao.save_file(cursor, file_metadata, is_shared_now, is_public_now)
-                            dao.save_event(cursor, change_id, file_id, event_type, actor_id, change_time, json.dumps(file_metadata))
-                            actor_name = actor.get('displayName', 'Unknown') if actor else 'Unknown'
-                            print(f"  - Stored Event: '{event_type}' for '{file_metadata.get('name')}' by {actor_name}")
-                    except HttpError as error:
-                        # (Error handling unchanged)
-                        if error.resp.status == 404:
-                            event_type = "file_deleted_permanently"
-                            dao.save_event(cursor, f"{file_id}-{change_time}", file_id, event_type, None, change_time, '{}')
-                            print(f"  - Stored Event: '{event_type}' for file {file_id}")
-                        else:
-                            print(f"  - Could not process file {file_id}: {error}")
+                            full_meta = drive_v3_service.files().get(fileId=file_id, fields="*").execute(); actor = full_meta.get('lastModifyingUser'); actor_id = actor.get('permissionId') if actor else None; permissions = full_meta.get('permissions', []); is_shared = is_externally_shared(permissions, user_email); is_public = is_publicly_shared(permissions)
+                            dao.save_file(cursor, full_meta, is_shared, is_public); dao.save_event(cursor, change_id, file_id, event_type, actor_id, change_time, json.dumps(full_meta)); changes_processed += 1; print(f"  - [Changes API] Stored Fallback Event: '{event_type}' for '{full_meta.get('name')}'")
+                except HttpError: pass
             
-            # (End of loop unchanged)
+            # --- FIX: Commit and set meta value INSIDE the same connection ---
+            new_start_page_token = response.get('newStartPageToken')
+            if new_start_page_token:
+                dao.set_meta_value(cursor, "startPageToken", new_start_page_token)
             conn.commit()
+            
             page_token = response.get('nextPageToken')
-            if not page_token:
-                new_start_page_token = response.get('newStartPageToken')
-                dao.set_meta_value("startPageToken", new_start_page_token)
-                break
-    print("--- Data Ingestion Complete ---")
+            if not page_token: break
+        if changes_processed == 0: print("No fallback moves/renames found.")
 
-# The scan_all_files function also needs to be updated to pass the new flag.
+    print("\n--- Data Ingestion Complete ---")
+# The scan_all_files function is for the initial setup and remains largely unchanged.
+# Its logic for determining sharing status is correct.
 def scan_all_files(creds: Credentials):
-    # ... (similar changes needed here, but let's focus on fixing ingest_once first)
     print("\n--- Starting Full Drive Scan (this may take a while)... ---")
     service = build('drive', 'v3', credentials=creds)
     user_info = service.about().get(fields="user").execute()

@@ -1,40 +1,40 @@
-# app/analysis/ntw.py (Final Version with Blended Base & Cascading Amplifiers)
+# app/analysis/ntw.py (FINAL, COMPLETE, AND CORRECTED)
 
 from app.db import dao
 from app.analysis.event_risk import calculate_event_risk_score
 from app.analysis.narrative_builder import analyze_narratives_for_file, analyze_mass_deletion_for_user, analyze_ransomware_footprint
 from app.analysis.ml_risk import calculate_ml_risk_score
 from app.analysis.contextual_risk import calculate_contextual_risk_score
+from app import config
 
 def _calculate_blended_base_score(er_score, nr_score) -> tuple[float, str]:
     """
     Implements the Narrative Confidence Weighting to produce a blended base score.
     """
-    narrative_confidence = min(1.0, nr_score / 30.0)
+    narrative_confidence = min(1.0, nr_score / config.NARRATIVE_CONFIDENCE_MAX_SCORE)
     
-    if narrative_confidence > 0.7:  # High confidence narrative
-        base_score = nr_score + (er_score * 0.1) # Dominated by NR
+    if narrative_confidence > config.NARRATIVE_CONFIDENCE_THRESHOLDS["HIGH"]:
+        base_score = nr_score + (er_score * 0.1)
         tier = "Narrative-Driven (High Confidence)"
-    elif narrative_confidence > 0.3:  # Medium confidence narrative  
-        base_score = (nr_score * 0.7) + (er_score * 0.3) # A true blend
+    elif narrative_confidence > config.NARRATIVE_CONFIDENCE_THRESHOLDS["MEDIUM"]:
+        base_score = (nr_score * 0.7) + (er_score * 0.3)
         tier = "Blended (Medium Confidence)"
-    else:  # Low/no narrative confidence
-        base_score = er_score + (nr_score * 0.2) # Dominated by ER
+    else:
+        base_score = er_score + (nr_score * 0.2)
         tier = "Event-Driven (Low Confidence)"
         
     return base_score, tier
 
 def get_final_threat_score(event: dict) -> dict:
     """
-    The main orchestrator, implementing the Blended Base & Cascading Amplifiers framework.
+    The main orchestrator, using config for robust amplifier logic.
     """
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # --- Step 1: Gather Raw Intelligence from all Specialists ---
-        er_score, er_reasons = calculate_event_risk_score(cursor, event)
-        cr_score, cr_reasons = calculate_contextual_risk_score(cursor, event)
-        mr_score, mr_reasons = calculate_ml_risk_score(cursor, event)
+        er_score, er_reasons, er_tags = calculate_event_risk_score(cursor, event)
+        cr_score, cr_reasons, cr_tags = calculate_contextual_risk_score(cursor, event)
+        mr_score, mr_reasons, mr_tags = calculate_ml_risk_score(cursor, event)
         
         nr_score = 0.0
         nr_reasons = []
@@ -50,42 +50,34 @@ def get_final_threat_score(event: dict) -> dict:
             user_nr_score, user_nr_reasons_user = analyze_mass_deletion_for_user(cursor, user_id)
             nr_score += user_nr_score
             nr_reasons.extend(user_nr_reasons_user)
-            
-            # --- ADDED: Call the new Ransomware Detective ---
-            if event_ts: # We need a timestamp to analyze the window
+            if event_ts:
                 ransom_nr_score, ransom_nr_reasons = analyze_ransomware_footprint(cursor, user_id, event_ts)
                 nr_score += ransom_nr_score
                 nr_reasons.extend(ransom_nr_reasons)
 
-    # --- Step 2: Calculate the Blended Base Score ---
-    # (This logic is your correct, existing logic and is unchanged)
     base_threat_score, logic_tier = _calculate_blended_base_score(er_score, nr_score)
 
-    # --- Step 3: Calculate the Total Bonus for Each Amplifier Category ---
-    # (This logic is your correct, existing logic and is unchanged)
     er_amplifier_bonus = 0.0
-    if "ER: Activity occurred outside of typical hours" in er_reasons:
-        er_amplifier_bonus += 0.5
+    if "OFF_HOURS_ACTIVITY" in er_tags:
+        er_amplifier_bonus += config.AMPLIFIER_BONUSES["OFF_HOURS_ACTIVITY"]
     cr_amplifier_bonus = 0.0
-    if "CR: Action on an old, dormant file" in cr_reasons:
-        cr_amplifier_bonus += 0.75
-    if "CR: Event involves a compressed archive file" in cr_reasons:
-        cr_amplifier_bonus += 0.25
+    if "DORMANT_FILE_ACTIVATION" in cr_tags:
+        cr_amplifier_bonus += config.AMPLIFIER_BONUSES["DORMANT_FILE_ACTIVATION"]
+    if "COMPRESSED_ARCHIVE" in cr_tags:
+        cr_amplifier_bonus += config.AMPLIFIER_BONUSES["COMPRESSED_ARCHIVE"]
     mr_amplifier_bonus = 0.0
-    if mr_score > 0:
-        mr_amplifier_bonus += (mr_score / 25.0)
+    if "ML_CRITICAL_ANOMALY" in mr_tags or "ML_HIGH_ANOMALY" in mr_tags:
+        mr_amplifier_bonus += (mr_score / config.ML_RISK_SCORES["CRITICAL"])
 
-    # --- Step 4: Calculate the Final Escalated Score ---
-    # (This logic is your correct, existing logic and is unchanged)
     final_score = base_threat_score * (1 + er_amplifier_bonus) * (1 + cr_amplifier_bonus) * (1 + mr_amplifier_bonus)
     final_score = min(final_score, 100.0)
 
+    all_tags = er_tags + cr_tags + mr_tags
+    
     output = {
-        "final_score": final_score,
-        "threat_level": "Low",
+        "final_score": final_score, "threat_level": "Low", "tags": all_tags,
         "breakdown": {
-            "logic_tier": logic_tier,
-            "base_score": base_threat_score,
+            "logic_tier": logic_tier, "base_score": base_threat_score,
             "er_details": {"score": er_score, "reasons": er_reasons, "amplifier": er_amplifier_bonus},
             "nr_details": {"score": nr_score, "reasons": nr_reasons},
             "cr_details": {"score": cr_score, "reasons": cr_reasons, "amplifier": cr_amplifier_bonus},
@@ -100,12 +92,16 @@ def get_final_threat_score(event: dict) -> dict:
     
     return output
 
+# --- RESTORED AND UPGRADED TEST HARNESS ---
 def test_scoring_harness():
+    """
+    A command-line utility to fetch the most recent events from the database
+    and run them through the full scoring engine for debugging and tuning.
+    """
     print("\n--- Running Final Blended & Cascading Framework Analysis ---")
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # --- CORRECTED QUERY: Changed f.mimeType to f.mime_type ---
         query = """
             SELECT 
                 e.*, f.name, f.mime_type, f.is_shared_externally, f.vt_positives, 
@@ -131,6 +127,7 @@ def test_scoring_harness():
             print("\n" + "="*70)
             print(f"Scoring Event ID: {event_dict['id']} ({event_dict['event_type']}) on file '{event_dict.get('name', 'N/A')}'")
             print(f"Final Escalated Score: {result['final_score']:.2f}/100 ({result['threat_level']})")
+            print(f"Detected Tags: {result.get('tags', [])}") # Added tags to output
             print("-" * 70)
             
             bd = result['breakdown']
@@ -140,6 +137,10 @@ def test_scoring_harness():
             print(f"  - Narrative Risk: {bd['nr_details']['score']:.2f}")
             print(f"  - Contextual Risk:{bd['cr_details']['score']:.2f} -> Amplifier: +{bd['cr_details']['amplifier']:.0%}")
             print(f"  - ML Risk:        {bd['mr_details']['score']:.2f} -> Amplifier: +{bd['mr_details']['amplifier']:.0%}")
+            print("\n--- Contributing Reasons ---")
+            for reason in bd['er_details']['reasons'] + bd['nr_details']['reasons'] + bd['cr_details']['reasons'] + bd['mr_details']['reasons']:
+                print(f"  - {reason}")
+            
             print("\n--- Final Calculation ---")
             print(f"  {bd['calculation']}")
     print("="*70)
