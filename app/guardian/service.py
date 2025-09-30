@@ -39,8 +39,7 @@ def run_learning_task():
 # --- THIS IS THE UPGRADED ANALYSIS & ALERTING FUNCTION ---
 def run_analysis_tasks():
     """
-    Runs the full analysis suite, now with state management to prevent duplicate alerts.
-    Correctly parses the orchestrator output to generate meaningful alerts.
+    Runs the full analysis suite, with corrected alert parsing logic.
     """
     print(f"GUARDIAN: [SCHEDULED TASK] Running analysis suite at {time.strftime('%H:%M:%S')}...")
     
@@ -49,7 +48,6 @@ def run_analysis_tasks():
         with dao.get_db_connection() as conn:
             cursor = conn.cursor()
             
-            # --- FIX 1: Select only events that have NOT been analyzed ---
             query = """
                 SELECT e.*, f.name, f.mime_type, f.is_shared_externally, f.vt_positives, 
                 f.created_time, f.modified_time, ub.typical_activity_hours_json 
@@ -67,16 +65,11 @@ def run_analysis_tasks():
                     event_dict = dict(event)
                     event_id = event_dict['id']
                     
-                    # Score the event
                     result = get_final_threat_score(event_dict)
-                    
-                    # --- FIX 3: Immediately mark the event as analyzed to prevent re-processing ---
-                    dao.update_event_analysis_status(cursor, event_id, 1) # 1 = Analyzed
+                    dao.update_event_analysis_status(cursor, event_id, 1)
 
-                    # --- FIX 2: Correctly parse the new output for alerting ---
                     if result['threat_level'] in ['High', 'Critical']:
                         bd = result['breakdown']
-                        # Determine the primary reason for the high score
                         scores = {
                             "Event Risk": bd['er_details']['score'],
                             "Narrative Risk": bd['nr_details']['score'],
@@ -84,10 +77,17 @@ def run_analysis_tasks():
                             "ML Risk": bd['mr_details']['score']
                         }
                         primary_category = max(scores, key=scores.get)
-                        details_key = f"{primary_category.split()[0].lower()}_details"
-                        reasons_list = bd[details_key]['reasons']
                         
-                        # Extract the most specific reason
+                        # --- THIS IS THE FIX ---
+                        # Handle the special 'ML Risk' vs 'mr_details' naming convention.
+                        if primary_category == "ML Risk":
+                            details_key = "mr_details"
+                        else:
+                            # This works for "Event Risk" -> "er_details", etc.
+                            details_key = f"{primary_category.split()[0].lower()}_details"
+                        # --- END OF FIX ---
+
+                        reasons_list = bd[details_key]['reasons']
                         primary_reason = reasons_list[-1] if reasons_list else f"High {primary_category}"
 
                         send_notification(
@@ -95,17 +95,15 @@ def run_analysis_tasks():
                             f"Score: {result['final_score']:.0f}/100. Reason: {primary_reason}"
                         )
                 
-                conn.commit() # Commit the 'is_analyzed' changes
+                conn.commit()
             else:
                 print("GUARDIAN: No new events to analyze.")
 
-        # The slow background scanner can run after the main analysis
         print("GUARDIAN: Starting slow scan for known threats (VirusTotal)...")
         scan_unscanned_files()
         
         print("GUARDIAN: Analysis suite completed.")
     except Exception as e:
-        # Added traceback for better error diagnosis
         import traceback
         print(f"GUARDIAN: ERROR during analysis task: {e}")
         traceback.print_exc()

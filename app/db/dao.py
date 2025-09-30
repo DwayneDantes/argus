@@ -129,3 +129,20 @@ def find_file_by_name(cursor: sqlite3.Cursor, file_name: str) -> sqlite3.Row | N
 def update_event_analysis_status(cursor: sqlite3.Cursor, event_id: int, status: int):
     """Marks an event as analyzed or un-analyzed."""
     cursor.execute("UPDATE events SET is_analyzed = ? WHERE id = ?", (status, event_id))
+
+# Add this new function to app/db/dao.py
+
+def get_file_event_history(cursor: sqlite3.Cursor, file_id: str, lookback_days: int = 7) -> list[sqlite3.Row]:
+    """
+    Retrieves the complete, ordered event history for a specific file
+    within a given lookback period to ensure performance.
+    """
+    query = """
+        SELECT id, event_type, actor_user_id, ts, details_json
+        FROM events
+        WHERE file_id = ? AND ts >= date('now', ?)
+        ORDER BY ts ASC
+    """
+    lookback_str = f'-{lookback_days} days'
+    cursor.execute(query, (file_id, lookback_str))
+    return cursor.fetchall()
