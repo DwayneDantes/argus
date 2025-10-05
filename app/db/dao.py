@@ -4,6 +4,12 @@ from pathlib import Path
 import json
 from datetime import datetime
 
+def convert_timestamp_iso(val: bytes) -> datetime:
+    """Converts an ISO 8601 timestamp string from the DB into a datetime object."""
+    return datetime.fromisoformat(val.decode())
+
+sqlite3.register_converter("timestamp", convert_timestamp_iso)
+
 APP_DIR = Path.home() / ".argus"
 DB_FILE = APP_DIR / "argus.db"
 SCHEMA_FILE = Path(__file__).parent / "schema.sql"
@@ -113,14 +119,16 @@ def get_file_vt_score(cursor: sqlite3.Cursor, file_id: str) -> int | None:
     result = cursor.fetchone()
     return result['vt_positives'] if result and result['vt_positives'] is not None else None
 
-def count_recent_user_activity(cursor: sqlite3.Cursor, user_id: str, end_ts_str: str, window_minutes: int = 10) -> int:
+def count_recent_user_activity(cursor: sqlite3.Cursor, user_id: str, end_ts: datetime, window_minutes: int = 10) -> int:
+    """Counts user activity in a window ending at the given datetime object."""
+    # Convert the aware datetime object to a string for the SQL query
+    end_ts_str = end_ts.isoformat()
     query = f"""
         SELECT COUNT(*) as event_count FROM events WHERE actor_user_id = ? AND ts <= ? AND ts >= datetime(?, '-{window_minutes} minutes')
     """
     cursor.execute(query, (user_id, end_ts_str, end_ts_str))
     result = cursor.fetchone()
     return result['event_count'] if result else 0
-
 def get_priority_unscanned_files(cursor: sqlite3.Cursor, limit: int = 5) -> list[sqlite3.Row]:
     query = """
         SELECT id, md5Checksum FROM files WHERE md5Checksum IS NOT NULL AND vt_scan_ts IS NULL AND created_time >= datetime('now', '-1 day')
@@ -209,18 +217,18 @@ def get_events_for_narrative(cursor: sqlite3.Cursor, narrative_id: int) -> list[
     """
     Fetches the full event details for all events linked to a specific narrative,
     ordered chronologically. This is the core function for building a timeline.
+    
+    CORRECTED: Uses explicit aliases for all columns to ensure a perfect match
+    with the Pydantic model in the API layer.
     """
-    # This query joins the mapping table with the main events and files tables
-    # to retrieve all the rich data needed for a timeline visualization.
     query = """
         SELECT
-            e.id,
-            e.event_type,
-            e.actor_user_id,
-            e.ts,
-            e.details_json,
-            f.name as file_name,
-            ne.stage
+            e.id                AS id,
+            e.event_type        AS event_type,
+            e.actor_user_id     AS actor_user_id,
+            e.ts                AS ts,
+            f.name              AS file_name,
+            ne.stage            AS stage
         FROM narrative_events ne
         JOIN events e ON ne.event_id = e.id
         LEFT JOIN files f ON e.file_id = f.id

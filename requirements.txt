@@ -20,3 +20,5 @@ xgboost
 matplotlib
 seaborn
 joblib
+fastapi
+uvicorn[standard]

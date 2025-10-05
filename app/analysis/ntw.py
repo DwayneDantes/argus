@@ -130,6 +130,7 @@ def test_scoring_harness():
             event_dict = dict(event)
             result = get_final_threat_score(event_dict)
             
+            # (The rest of the original printing logic follows)
             print("\n" + "="*70)
             print(f"Scoring Event ID: {event_dict['id']} ({event_dict['event_type']}) on file '{event_dict.get('name', 'N/A')}'")
             print(f"Final Escalated Score: {result['final_score']:.2f}/100 ({result['threat_level']})")
