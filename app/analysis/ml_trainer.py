@@ -7,7 +7,7 @@ from datetime import datetime
 import json
 
 from app.db import dao
-from app.analysis.ml_featurizer import featurize_event, get_feature_names
+from ml_utils.base_featurizer import featurize_event, get_feature_names
 
 MODEL_DIR = Path.home() / ".argus"
 MODEL_PATH = MODEL_DIR / "argus_model.joblib"

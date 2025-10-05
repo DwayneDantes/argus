@@ -1,8 +1,9 @@
 # app/analysis/contextual_risk.py (Upgraded with Burst Activity Detection)
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone 
 from app.db import dao # Make sure dao is imported
 from app import config
+
 
 def calculate_contextual_risk_score(cursor, event: dict) -> tuple[float, list[str], list[str]]:
     """
@@ -19,7 +20,7 @@ def calculate_contextual_risk_score(cursor, event: dict) -> tuple[float, list[st
         # ... (dormant file logic is the same) ...
         created_time_str = event.get('created_time'); modified_time_str = event.get('modified_time')
         if created_time_str and modified_time_str:
-            now = datetime.now(); created_dt = datetime.fromisoformat(created_time_str.replace('Z', '')); last_modified_dt = datetime.fromisoformat(modified_time_str.replace('Z', '')); is_old_file = (now - created_dt) > timedelta(days=365); is_dormant = (now - last_modified_dt) > timedelta(days=180)
+            now = datetime.now(timezone.utc); created_dt = datetime.fromisoformat(created_time_str.replace('Z', '')); last_modified_dt = datetime.fromisoformat(modified_time_str.replace('Z', '')); is_old_file = (now - created_dt) > timedelta(days=365); is_dormant = (now - last_modified_dt) > timedelta(days=180)
             if is_old_file and is_dormant:
                 # --- Use constant from the config file ---
                 score += config.CONTEXTUAL_RISK_ADDITIONS["DORMANT_FILE"]

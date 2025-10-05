@@ -1,4 +1,4 @@
-# app/db/dao.py (CORRECTED with proper connection handling)
+# app/db/dao.py (FINAL, ROBUST VERSION)
 import sqlite3
 from pathlib import Path
 import json
@@ -14,14 +14,39 @@ def get_db_connection() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     return conn
 
+# --- THIS IS THE FINAL FIX ---
 def initialize_database():
+    """
+    Initializes the database from the schema file, but only if the 'events'
+    table does not already exist. This makes the function safe to call multiple times.
+    """
+    # First, check if the database file exists and has tables.
+    if DB_FILE.exists() and DB_FILE.stat().st_size > 0:
+        try:
+            with get_db_connection() as conn:
+                # Check for the existence of a key table. If it's there, the DB is initialized.
+                cursor = conn.cursor()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='events'")
+                if cursor.fetchone():
+                    # print("Database already initialized.") # Optional: uncomment for verbose logging
+                    return # Exit the function silently
+        except sqlite3.DatabaseError:
+            # The file might be corrupt or empty, so we proceed to initialize.
+            pass
+
+    # If the check fails or the file doesn't exist, proceed with initialization.
     print("Initializing database...")
-    with get_db_connection() as conn:
-        with open(SCHEMA_FILE, 'r') as f:
-            schema_script = f.read()
-        conn.executescript(schema_script)
-        conn.commit()
-    print("Database ready.")
+    try:
+        with get_db_connection() as conn:
+            with open(SCHEMA_FILE, 'r') as f:
+                schema_script = f.read()
+            conn.executescript(schema_script)
+            conn.commit()
+        print("Database ready.")
+    except Exception as e:
+        print(f"FATAL: Could not initialize database. Error: {e}")
+# --- END OF FIX ---
+
 
 # --- REFACTORED FUNCTION ---
 def get_meta_value(cursor: sqlite3.Cursor, key: str) -> str | None:
@@ -35,7 +60,7 @@ def set_meta_value(cursor: sqlite3.Cursor, key: str, value: str):
     """Sets a meta value using the provided database cursor."""
     cursor.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
 
-# --- All functions below this line are unchanged, until get_all_events_for_ml_training ---
+
 def get_file_details(cursor: sqlite3.Cursor, file_id: str) -> sqlite3.Row | None:
     cursor.execute("SELECT id, name, parents_json, modified_time, is_shared_externally, is_shared_publicly FROM files WHERE id = ?", (file_id,))
     return cursor.fetchone()
@@ -104,12 +129,7 @@ def get_priority_unscanned_files(cursor: sqlite3.Cursor, limit: int = 5) -> list
     cursor.execute(query, (limit,))
     return cursor.fetchall()
 
-# --- REFACTORED FUNCTION ---
 def get_all_events_for_ml_training(cursor: sqlite3.Cursor) -> list[sqlite3.Row]:
-    """
-    Fetches all events and joins them with all necessary data from other tables
-    required for the ML featurizer, using the provided database cursor.
-    """
     query = """
         SELECT
             e.*, f.name, f.mime_type, f.is_shared_externally, f.is_shared_publicly,
@@ -127,16 +147,9 @@ def find_file_by_name(cursor: sqlite3.Cursor, file_name: str) -> sqlite3.Row | N
     return cursor.fetchone()
 
 def update_event_analysis_status(cursor: sqlite3.Cursor, event_id: int, status: int):
-    """Marks an event as analyzed or un-analyzed."""
     cursor.execute("UPDATE events SET is_analyzed = ? WHERE id = ?", (status, event_id))
 
-# Add this new function to app/db/dao.py
-
-def get_file_event_history(cursor: sqlite3.Cursor, file_id: str, lookback_days: int = 7) -> list[sqlite3.Row]:
-    """
-    Retrieves the complete, ordered event history for a specific file
-    within a given lookback period to ensure performance.
-    """
+def get_file_event_history(cursor: sqlite3.Cursor, file_id: str, lookback_days: int = 90) -> list[sqlite3.Row]:
     query = """
         SELECT id, event_type, actor_user_id, ts, details_json
         FROM events
@@ -145,4 +158,74 @@ def get_file_event_history(cursor: sqlite3.Cursor, file_id: str, lookback_days: 
     """
     lookback_str = f'-{lookback_days} days'
     cursor.execute(query, (file_id, lookback_str))
+    return cursor.fetchall()
+
+
+def get_events_for_user_context(cursor: sqlite3.Cursor, user_id: str, window_days: int = 2) -> list[sqlite3.Row]:
+    query = """
+        SELECT id, file_id, event_type, actor_user_id, ts
+        FROM events
+        WHERE actor_user_id = ? AND ts >= date('now', ?)
+        ORDER BY ts ASC
+    """
+    lookback_str = f'-{window_days} days'
+    cursor.execute(query, (user_id, lookback_str))
+    return cursor.fetchall()
+
+def create_narrative(cursor: sqlite3.Cursor, narrative_data: dict) -> int:
+    query = """
+        INSERT INTO narratives (narrative_type, primary_actor_id, start_time, end_time, final_score)
+        VALUES (?, ?, ?, ?, ?)
+    """
+    cursor.execute(query, (
+        narrative_data['narrative_type'],
+        narrative_data['primary_actor_id'],
+        narrative_data['start_time'],
+        narrative_data['end_time'],
+        narrative_data['score']
+    ))
+    return cursor.lastrowid
+
+def link_events_to_narrative(cursor: sqlite3.Cursor, narrative_id: int, events_with_stages: list[dict]):
+    events_to_insert = [
+        (narrative_id, event['event_id'], event.get('stage'))
+        for event in events_with_stages
+    ]
+    cursor.executemany(
+        "INSERT INTO narrative_events (narrative_id, event_id, stage) VALUES (?, ?, ?)",
+        events_to_insert
+    )
+
+
+def get_narrative_details(cursor: sqlite3.Cursor, narrative_id: int) -> sqlite3.Row | None:
+    """
+    Fetches the header information for a single narrative incident.
+    """
+    query = "SELECT * FROM narratives WHERE narrative_id = ?"
+    cursor.execute(query, (narrative_id,))
+    return cursor.fetchone()
+
+def get_events_for_narrative(cursor: sqlite3.Cursor, narrative_id: int) -> list[sqlite3.Row]:
+    """
+    Fetches the full event details for all events linked to a specific narrative,
+    ordered chronologically. This is the core function for building a timeline.
+    """
+    # This query joins the mapping table with the main events and files tables
+    # to retrieve all the rich data needed for a timeline visualization.
+    query = """
+        SELECT
+            e.id,
+            e.event_type,
+            e.actor_user_id,
+            e.ts,
+            e.details_json,
+            f.name as file_name,
+            ne.stage
+        FROM narrative_events ne
+        JOIN events e ON ne.event_id = e.id
+        LEFT JOIN files f ON e.file_id = f.id
+        WHERE ne.narrative_id = ?
+        ORDER BY e.ts ASC
+    """
+    cursor.execute(query, (narrative_id,))
     return cursor.fetchall()

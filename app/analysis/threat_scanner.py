@@ -1,72 +1,63 @@
-# app/analysis/threat_scanner.py (Upgraded with Priority Scanning)
+# app/analysis/threat_scanner.py (FINAL, EFFICIENT BATCH VERSION)
 
 import time
 from datetime import datetime
 from app.db import dao
 from app.threat_intel import virustotal
 
-SCAN_INTERVAL_SECONDS = 20
+# We wait 15 seconds between API calls. VT public API limit is 4 calls/minute.
+SCAN_INTERVAL_SECONDS = 15 
 
 def scan_unscanned_files():
     """
-    Main function for threat scanning, now with a two-tiered priority system.
+    Performs one cycle of threat scanning in batches, respecting API rate limits.
+    It prioritizes new files but also works through the old backlog. It is 
+    designed to be called repeatedly by a scheduler.
     """
-    print("\n--- Starting Threat Intelligence Scan (with Priority) ---")
-    
+    files_to_scan = []
+    scan_type = "None"
+
+    # This function opens its own connection, making it an independent task.
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # --- TIER 1: Scan recent, high-priority files first ---
-        print("Checking for new, high-priority files to scan...")
-        priority_files = dao.get_priority_unscanned_files(cursor)
-
+        # --- Tier 1: Prioritize a batch of recent files ---
+        # We fetch a small batch (e.g., up to 4, to stay within a 1-min window)
+        priority_files = dao.get_priority_unscanned_files(cursor, limit=4)
         if priority_files:
-            print(f"Found {len(priority_files)} new files. Scanning them first...")
-            for file_row in priority_files:
-                # (The scanning logic is the same as before)
-                file_id = file_row['id']
-                file_hash = file_row['md5Checksum']
-                print(f"  > [Priority] Scanning hash: {file_hash}")
-                report = virustotal.get_hash_report(file_hash)
-                positives = 0
-                if report and 'data' in report and 'attributes' in report['data']:
-                    stats = report['data']['attributes']['last_analysis_stats']
-                    positives = stats.get('malicious', 0) + stats.get('suspicious', 0)
-                    print(f"    - Result: {positives} positive detections.")
-                else:
-                    print("    - Result: Hash not found in VT database or an error occurred.")
-                dao.update_file_vt_score(cursor, file_id, positives)
-                conn.commit()
-                # We still wait to respect the rate limit
-                time.sleep(SCAN_INTERVAL_SECONDS)
+            files_to_scan = priority_files
+            scan_type = "Priority"
         else:
-            print("No high-priority files found.")
+            # --- Tier 2: If no new files, process a batch from the backlog ---
+            backlog_files = dao.get_unscanned_files(cursor, limit=4)
+            if backlog_files:
+                files_to_scan = backlog_files
+                scan_type = "Backlog"
 
-        # --- TIER 2: Scan the older backlog of files ---
-        print("\nChecking for older, backlog files to scan...")
-        # We'll just scan one from the backlog per run to keep it slow and steady
-        backlog_files = dao.get_unscanned_files(cursor, limit=1)
-
-        if not backlog_files:
-            print("No backlog files to scan. The database is fully up-to-date.")
+        if not files_to_scan:
+            print("GUARDIAN: [Scanner] No unscanned files found.")
             return
 
-        print("Found an older file in the backlog. Scanning it now...")
-        for file_row in backlog_files:
-            # (The scanning logic is the same as before)
+        print(f"GUARDIAN: [Scanner] Found {len(files_to_scan)} files to scan in '{scan_type}' queue.")
+        
+        for i, file_row in enumerate(files_to_scan):
             file_id = file_row['id']
             file_hash = file_row['md5Checksum']
-            print(f"  > [Backlog] Scanning hash: {file_hash}")
+            
+            print(f"  > [{scan_type}] Scanning file {i+1}/{len(files_to_scan)} (hash: {file_hash})")
             report = virustotal.get_hash_report(file_hash)
             positives = 0
             if report and 'data' in report and 'attributes' in report['data']:
                 stats = report['data']['attributes']['last_analysis_stats']
                 positives = stats.get('malicious', 0) + stats.get('suspicious', 0)
                 print(f"    - Result: {positives} positive detections.")
-            else:
-                print("    - Result: Hash not found in VT database or an error occurred.")
+            
             dao.update_file_vt_score(cursor, file_id, positives)
-            conn.commit()
-            time.sleep(SCAN_INTERVAL_SECONDS)
+            
+            # --- CRITICAL: Wait *between* each API call in the batch ---
+            if i < len(files_to_scan) - 1: # Don't wait after the last one
+                time.sleep(SCAN_INTERVAL_SECONDS)
 
-    print("\n--- Threat Intelligence Scan Cycle Complete. ---")
+        # Commit all changes for the batch at the end of the transaction
+        conn.commit()
+        print(f"--- Threat Intelligence Scan Cycle Complete. {len(files_to_scan)} files processed. ---")

@@ -14,3 +14,9 @@ reportlab
 weasyprint
 Jinja2
 sqlite-utils
+pyyaml
+scikit-learn
+xgboost
+matplotlib
+seaborn
+joblib

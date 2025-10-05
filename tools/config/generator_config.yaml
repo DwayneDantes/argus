@@ -1,0 +1,105 @@
+#
+# Definitive configuration for the Synthetic Dataset Generator V4 (High-Precision Target)
+#
+
+# --- Section 1: Benign Data Source Control ---
+benign_source:
+  prod_db_path: "C:/Users/My PC/.argus/argus.db"
+  cache_path: "./benign_canvas_v4.json"
+  days_to_fetch: 90
+
+# --- Section 2: Benign Persona Simulation Engine ---
+benign_simulation:
+  enabled: true
+  simulation_days: 240 # INCREASED: More days for a larger benign canvas
+  num_users_per_persona:
+    software_engineer: 10
+    sales_executive: 5
+    hr_manager: 3
+    student: 15
+    freelance_consultant: 5
+
+  personas:
+    # --- Corporate Personas ---
+    software_engineer:
+      work_hours_utc: [10, 22]
+      weekend_activity_prob: 0.25
+      ip_addresses: { office: ["203.0.113.10/30"], home: ["198.51.100.5", "198.51.100.12"], vpn: ["10.8.0.0/16"] }
+      daily_actions_mean: 50
+      daily_actions_stddev: 20
+      action_probabilities: [ { event: 'file_created', weight: 30 }, { event: 'file_modified', weight: 30 }, { event: 'file_trashed', weight: 25 }, { event: 'file_deleted_permanently', weight: 5 }, { event: 'file_renamed', weight: 5 }, { event: 'folder_created', weight: 5 }, { event: 'file_opened', weight: 20 } ]
+    sales_executive:
+      work_hours_utc: [7, 18]
+      weekend_activity_prob: 0.15
+      ip_addresses: { office: ["203.0.113.10/30"], home: ["198.51.100.21"], travel: ["18.217.132.188"] }
+      external_collaboration_prob: 0.25
+      external_domains: ["prospect-company.com", "customer.net", "legal-firm.com"]
+      daily_actions_mean: 15
+      daily_actions_stddev: 5
+      action_probabilities: [ { event: 'file_downloaded', weight: 40 }, { event: 'file_shared_internally', weight: 30 }, { event: 'file_opened', weight: 20 }, { event: 'file_shared_externally', weight: 10 } ]
+    hr_manager:
+      work_hours_utc: [8, 16]
+      weekend_activity_prob: 0.01
+      ip_addresses: { office: ["203.0.113.10/30"], home: ["198.51.100.15"] }
+      external_collaboration_prob: 0.05
+      external_domains: ["benefits-provider.com"]
+      daily_actions_mean: 20
+      daily_actions_stddev: 8
+      action_probabilities: [ { event: 'file_created', weight: 20 }, { event: 'file_modified', weight: 30 }, { event: 'permission_changed', weight: 25 }, { event: 'file_shared_internally', weight: 20 }, { event: 'file_trashed', weight: 5 } ]
+    
+    # --- Thesis-Aligned Personas ---
+    student:
+      work_hours_utc: [16, 2]
+      weekend_activity_prob: 0.60
+      ip_addresses: { home: ["198.51.100.101", "198.51.100.102"], travel: ["104.18.21.165", "8.8.8.8"] }
+      external_collaboration_prob: 0.85
+      external_domains: ["gmail.com", "outlook.com", "university.edu"]
+      daily_actions_mean: 25
+      daily_actions_stddev: 15
+      action_probabilities: [ { event: 'file_created', weight: 20 }, { event: 'file_modified', weight: 30 }, { event: 'file_shared_externally', weight: 25 }, { event: 'comment_added', weight: 15 }, { event: 'file_downloaded', weight: 10 } ]
+    freelance_consultant:
+      work_hours_utc: [6, 20]
+      weekend_activity_prob: 0.40
+      ip_addresses: { home: ["192.0.2.50"], vpn: ["10.9.0.0/16"], travel: ["54.160.105.25", "35.171.157.123"] }
+      external_collaboration_prob: 0.70
+      external_domains: ["client-a.com", "client-b.net", "subcontractor.org", "gmail.com"]
+      daily_actions_mean: 40
+      daily_actions_stddev: 10
+      action_probabilities: [ { event: 'file_created', weight: 20 }, { event: 'file_modified', weight: 25 }, { event: 'file_shared_externally', weight: 25 }, { event: 'file_shared_internally', weight: 5 }, { event: 'permission_changed', weight: 10 }, { event: 'file_downloaded', weight: 15 } ]
+
+# --- Section 3: Malicious Scenario Injection ---
+scenarios:
+  data_exfiltration:
+    enabled: true
+    count: 100 # INCREASED
+    # NEW: Variability profiles for more realistic attack patterns
+    profiles:
+      - { name: "smash_and_grab", weight: 80, rename_delay_seconds: [120, 600], share_delay_seconds: [120, 600] }
+      - { name: "low_and_slow", weight: 20, rename_delay_seconds: [3600, 86400], share_delay_seconds: [3600, 86400] } # Delays up to 1 day
+  mass_deletion:
+    enabled: true
+    count: 50 # INCREASED
+    files_to_trash: [50, 100]
+    perm_delete_ratio: [0.1, 0.3]
+    time_window_minutes: [5, 60]
+  ransomware:
+    enabled: true
+    count: 150 # INCREASED
+    files_to_encrypt: [15, 40]
+    ransomware_families:
+      lockbit_v2: { weight: 15, extension_type: "fixed", extensions: [".lockbit"], note_filenames: ["Restore-My-Files.txt"] }
+      blackbasta: { weight: 10, extension_type: "fixed", extensions: [".basta"], note_filenames: ["readme.txt", "read-me.txt"] }
+      wannacry: { weight: 5, extension_type: "fixed", extensions: [".wncry"], note_filenames: ["@Please_Read_Me@.txt"] }
+      ryuk: { weight: 5, extension_type: "fixed", extensions: [".RYK"], note_filenames: ["RyukReadMe.txt"] }
+      clop: { weight: 10, extension_type: "fixed", extensions: [".Clop"], note_filenames: ["ClopReadMe.txt"] }
+      revil_sodinokibi: { weight: 15, extension_type: "random_alphanumeric", extension_length: 8, note_filenames: ["{extension}-readme.txt"] }
+      blackcat_alphv: { weight: 10, extension_type: "random_alphanumeric", extension_length: 7, note_filenames: ["RECOVER-{extension}-FILES.txt"] }
+      conti: { weight: 10, extension_type: "random_alphanumeric", extension_length: 5, note_filenames: ["readme.txt", "R3ADM3.txt"] }
+      phobos_dharma: { weight: 15, extension_type: "programmatic_phobos", contact_emails: ["recovery@devos.com"], note_filenames: ["info.txt", "info.hta"] }
+
+# --- Section 4: Output and Reproducibility ---
+output:
+  sqlite_path: "./argus_synthetic_dataset_v4.sqlite"
+  benign_cache: "./benign_canvas_v4.json"
+
+random_seed: 42
