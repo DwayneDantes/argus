@@ -2,7 +2,7 @@
 import argparse
 import yaml
 import logging
-from generator.synthetic_dataset_generator import SyntheticDatasetGenerator
+from .generator.synthetic_dataset_generator import SyntheticDatasetGenerator
 
 def setup_logging():
     """Sets up basic console logging."""

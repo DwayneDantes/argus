@@ -69,22 +69,15 @@ benign_simulation:
 
 # --- Section 3: Malicious Scenario Injection ---
 scenarios:
-  data_exfiltration:
+  stage_archive_exfil_v1:
     enabled: true
-    count: 100 # INCREASED
-    # NEW: Variability profiles for more realistic attack patterns
-    profiles:
-      - { name: "smash_and_grab", weight: 80, rename_delay_seconds: [120, 600], share_delay_seconds: [120, 600] }
-      - { name: "low_and_slow", weight: 20, rename_delay_seconds: [3600, 86400], share_delay_seconds: [3600, 86400] } # Delays up to 1 day
+    count: 50
   mass_deletion:
     enabled: true
-    count: 50 # INCREASED
-    files_to_trash: [50, 100]
-    perm_delete_ratio: [0.1, 0.3]
-    time_window_minutes: [5, 60]
+    count: 30
   ransomware:
     enabled: true
-    count: 150 # INCREASED
+    count: 20
     files_to_encrypt: [15, 40]
     ransomware_families:
       lockbit_v2: { weight: 15, extension_type: "fixed", extensions: [".lockbit"], note_filenames: ["Restore-My-Files.txt"] }
@@ -96,6 +89,11 @@ scenarios:
       blackcat_alphv: { weight: 10, extension_type: "random_alphanumeric", extension_length: 7, note_filenames: ["RECOVER-{extension}-FILES.txt"] }
       conti: { weight: 10, extension_type: "random_alphanumeric", extension_length: 5, note_filenames: ["readme.txt", "R3ADM3.txt"] }
       phobos_dharma: { weight: 15, extension_type: "programmatic_phobos", contact_emails: ["recovery@devos.com"], note_filenames: ["info.txt", "info.hta"] }
+
+benign_mimics:
+  project_decommissioning:
+    enabled: true
+    count: 20
 
 # --- Section 4: Output and Reproducibility ---
 output:

@@ -10,7 +10,8 @@ This file contains all tunable parameters, thresholds, and scores.
 
 # --- Core Paths ---
 # We define a base directory for models to keep things organized.
-MODEL_DIR = Path.home() / ".argus/ml_models"
+PROJECT_ROOT = Path(__file__).parent.parent # This gets the root 'argus' directory
+MODEL_DIR = PROJECT_ROOT / "tools" / "results"
 
 
 # --- Event Risk & Heuristics (heuristic_risk.py) ---
@@ -48,16 +49,17 @@ NARRATIVE_BASE_SCORES = {
 
 # --- NEW: Supervised Machine Learning Config (ml_risk.py) ---
 SUPERVISED_ML_CONFIG = {
-    # --- THIS IS THE CHANGE ---
-    # Just provide the filename. We will join it with MODEL_DIR in the code that uses it.
-    'model_filename': "argus_tuned_hybrid_model.joblib",
-    'columns_filename': "training_columns.json",
-    # --- END OF CHANGE ---
+    # --- FIX 1: Use the correct v2 model filenames ---
+    'model_filename': "argus_model_v2.joblib",
+    'columns_filename': "training_columns_v2.json",
 
-    # We will use the F1-optimized threshold found during tuning.
-    # This gives the best balance of Precision and Recall.
-    'prosecutor_min_confidence': 0.30,
+    # --- FIX 2: Adjust the confidence threshold to prevent premature alerts ---
+    # This is the confidence the ML model must have before its score is
+    # considered a primary driver of the Event Risk (ER) score.
+    'prosecutor_min_confidence': 0.65,
 
+    # This slope scales the model's probability (0.0-1.0) to the internal
+    # scoring system (roughly 0-100).
     'score_mapping_slope': 90.0
 }
 

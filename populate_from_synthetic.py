@@ -14,7 +14,7 @@ def main():
     """
     project_root = Path(__file__).parent.resolve()
     
-    source_db_path = project_root / "tools" / "argus_synthetic_dataset_v4.sqlite"
+    source_db_path = project_root / "tools" / "dataset_v2.sqlite"
     dest_db_path = Path.home() / ".argus" / "argus.db"
 
     if not source_db_path.exists():

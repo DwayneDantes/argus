@@ -1,101 +1,77 @@
+# app/analysis/ml_risk.py (UPGRADED for Sprint 3)
+
 import os
 import joblib
 import json
 import pandas as pd
 from pathlib import Path
+import logging
+logger = logging.getLogger(__name__)
 
-from ml_utils.feature_engineering import generate_feature_matrix
 from app.db import dao
-from app import config # Import the central config
+from app import config
 
-# --- Load all ML artifacts using paths from the config file ---
+# --- 1. Load the NEW v2 Model and Columns ---
 try:
-    # Build the full, absolute path here using the config variables
-    model_filename = config.SUPERVISED_ML_CONFIG['model_filename']
-    columns_filename = config.SUPERVISED_ML_CONFIG['columns_filename']
+    model_path = config.MODEL_DIR / 'argus_model_v2.joblib'
+    columns_path = config.MODEL_DIR / 'training_columns_v2.json'
 
-    model_path = os.path.join(config.MODEL_DIR, model_filename)
-    columns_path = os.path.join(config.MODEL_DIR, columns_filename)
-
-    if os.path.exists(model_path) and os.path.exists(columns_path):
-        model_artifact = joblib.load(model_path)
-        model = model_artifact['model'] # Extract the classifier
-        
-        # Best Practice: Use the optimized threshold from the artifact itself.
-        optimized_threshold = model_artifact['threshold']
-        config.SUPERVISED_ML_CONFIG['prosecutor_min_confidence'] = optimized_threshold
-        
-        
-        
+    if model_path.exists() and columns_path.exists():
+        model = joblib.load(model_path)
         with open(columns_path, 'r') as f:
             training_columns = json.load(f)
-        print("INFO: Supervised ML model and training columns loaded successfully.")
+        logger.info("Supervised ML model v2 and training columns loaded successfully.")
     else:
         model = None
         training_columns = None
-        print(f"WARNING: Supervised ML model ({model_path}) or columns file ({columns_path}) not found. ML score will be 0.")
+        logger.warning(f"Supervised ML model v2 ({model_path}) not found. ML score will be 0.")
 except Exception as e:
     model = None
     training_columns = None
-    print(f"ERROR: Could not load the supervised ML model. ML score will be 0. Error: {e}")
+    logger.error(f"Could not load supervised ML model v2. ML score will be 0. Error: {e}")
 
 
-
-def calculate_ml_risk_score(cursor, event: dict) -> float:
+def calculate_ml_risk_score(cursor, event: dict, micro_pattern_features: dict) -> float:
     """
-    Calculates a maliciousness probability score using the trained, supervised
-    XGBoost model. This function implements the full history-aware inference pipeline.
-
-    Args:
-        cursor: The database cursor for fetching historical context.
-        event: The new, incoming event dictionary to be scored.
-
-    Returns:
-        A float between 0.0 and 1.0 representing the probability of the event being malicious.
+    Calculates a maliciousness probability using the trained v2 model.
+    This function now accepts pre-computed micro-pattern features.
     """
     if model is None or training_columns is None:
         return 0.0
 
-    user_id = event.get('actor_user_id')
-    if not user_id:
-        return 0.0 # Cannot score events without a user context
+    # --- 2. Construct the Feature Vector ---
+    # Start with a dictionary of all possible features, initialized to 0
+    feature_dict = {col: 0.0 for col in training_columns}
 
-    # --- Step 1: Gather Contextual Data (The Inference Pipeline Blueprint) ---
-    historical_events_rows = dao.get_events_for_user_context(cursor, user_id, window_days=2)
-    all_events = [dict(row) for row in historical_events_rows] + [event]
-    events_df = pd.DataFrame(all_events)
-
-    # --- Step 2: Fetch and Convert Baselines and File Details for the Feature Generator ---
-    baseline_row = dao.get_user_baseline(cursor, user_id)
-    user_baselines = {user_id: dict(baseline_row) if baseline_row else {}}
+    # Fill in stateless features from the event itself
+    event_ts = event.get('ts')
+    if not isinstance(event_ts, pd.Timestamp):
+        event_ts = pd.to_datetime(event_ts)
+        
+    feature_dict['hour_of_day'] = event_ts.hour
+    feature_dict['day_of_week'] = event_ts.dayofweek
     
-    all_file_ids = events_df['file_id'].dropna().unique()
-    file_details_map = {}
-    for file_id in all_file_ids:
-        details_row = dao.get_file_details(cursor, file_id)
-        file_details_map[file_id] = dict(details_row) if details_row else {}
+    event_type_col = f"event_{event.get('event_type')}"
+    if event_type_col in feature_dict:
+        feature_dict[event_type_col] = 1.0
 
-    # --- Step 3: Generate the Full Feature Matrix using the Shared Library ---
-    X_live = generate_feature_matrix(events_df, user_baselines, file_details_map)
+    # Fill in the stateful micro-pattern features passed from the aggregator
+    for feature_name, value in micro_pattern_features.items():
+        if feature_name in feature_dict:
+            feature_dict[feature_name] = value
 
-    if X_live.empty:
-        return 0.0
-
-    # --- Step 4: Align Columns to Match Training Order (Crucial Step) ---
-    X_live_aligned = X_live.reindex(columns=training_columns, fill_value=0)
-
-    # --- Step 5: Make the Prediction ---
-    features_for_new_event = X_live_aligned.tail(1)
+    # The 'iforest_score' is part of the training columns, but we don't compute it live for now.
+    # It will default to 0, which is a safe baseline.
     
-    # --- DEBUGGING: START ---
-    # Let's inspect the 'model' variable right before we use it.
-    print("\n--- DEBUG INFO ---")
-    print(f"Type of 'model' variable: {type(model)}")
-    print(f"Content of 'model' variable: {model}")
-    print("--- END DEBUG INFO ---\n")
-    # --- DEBUGGING: END ---
-
+    # --- 3. Create DataFrame and Predict ---
+    # Convert the dictionary to a DataFrame in the correct column order
+    live_features_df = pd.DataFrame([feature_dict], columns=training_columns)
+    
     # Use predict_proba to get the probability of the "malicious" class (class 1)
-    malicious_probability = model.predict_proba(features_for_new_event)[:, 1][0]
-    
+    try:
+        malicious_probability = model.predict_proba(live_features_df)[:, 1][0]
+    except Exception as e:
+        logger.error(f"Error during ML prediction: {e}")
+        return 0.0
+        
     return float(malicious_probability)

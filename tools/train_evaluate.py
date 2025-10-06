@@ -1,4 +1,4 @@
-# tools/train_evaluate.py (UPGRADED WITH OPTUNA + CALIBRATION + THRESHOLD TUNING)
+# tools/train_evaluate.py (FINAL INTEGRATED AND CORRECTED VERSION)
 
 import logging
 import sqlite3
@@ -8,35 +8,37 @@ import joblib
 import os
 import json
 from pathlib import Path
+from datetime import datetime
 import optuna
-
-from ml_utils.feature_engineering import generate_feature_matrix
-
+import matplotlib.pyplot as plt
+import seaborn as sns
 from sklearn.ensemble import IsolationForest
-from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import (
     precision_recall_fscore_support, roc_auc_score,
     average_precision_score, confusion_matrix,
-    precision_recall_curve, f1_score, classification_report
+    precision_recall_curve, PrecisionRecallDisplay
 )
 import xgboost as xgb
-import matplotlib.pyplot as plt
-import seaborn as sns
-import optuna
 
-# --- Path Anchoring ---
-SCRIPT_DIR = Path(__file__).parent.resolve()
-DATABASE_PATH = SCRIPT_DIR / 'argus_synthetic_dataset_v4.sqlite'
-RESULTS_DIR = SCRIPT_DIR / 'results'
-MODEL_OUTPUT_PATH = RESULTS_DIR / 'argus_tuned_hybrid_model.joblib'
-COLUMNS_OUTPUT_PATH = RESULTS_DIR / 'training_columns.json'
-RANDOM_STATE = 42
-
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - [%(levelname)s] - %(message)s')
+# --- 1. SETUP & CONFIGURATION ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- load_data, simulate_context_for_training, print_metrics (unchanged) ---
+# Import the NEW feature engineering function
+from ml_utils.feature_engineering import generate_feature_matrix
+
+# Define constants for paths and parameters
+SCRIPT_DIR = Path(__file__).parent.resolve()
+DATABASE_PATH = SCRIPT_DIR.parent / 'dataset_v2.sqlite'
+RESULTS_DIR = SCRIPT_DIR / 'results'
+MODEL_OUTPUT_PATH = RESULTS_DIR / 'argus_model_v2.joblib'
+COLUMNS_OUTPUT_PATH = RESULTS_DIR / 'training_columns_v2.json'
+REPORT_OUTPUT_PATH = RESULTS_DIR / 'evaluation_report_v2.md'
+RANDOM_STATE = 42
+OPTUNA_TRIALS = 50
+
+# --- 2. DATA LOADING & SPLITTING ---
 def load_data(db_path: Path) -> pd.DataFrame | None:
     logger.info(f"Loading data from {db_path}...")
     if not db_path.exists():
@@ -44,163 +46,153 @@ def load_data(db_path: Path) -> pd.DataFrame | None:
         return None
     try:
         conn = sqlite3.connect(db_path)
-        df = pd.read_sql_query("SELECT * FROM events", conn)
+        query = "SELECT timestamp, actor_email, event_type, mime_type, is_malicious FROM events"
+        df = pd.read_sql_query(query, conn)
         logger.info(f"Successfully loaded {len(df)} events.")
         df['timestamp'] = pd.to_datetime(df['timestamp'])
-        return df
+        return df.sort_values('timestamp')
     finally:
         if 'conn' in locals() and conn:
             conn.close()
 
-def simulate_context_for_training(df: pd.DataFrame) -> tuple[dict, dict]:
-    logger.info("Simulating context (user baselines and file states)...")
-    user_baselines = {}
-    user_identifier_column = 'actor_email'
-    user_ids = df[user_identifier_column].dropna().unique()
-    for user_id in user_ids:
-        user_baselines[user_id] = {'typical_activity_hours_json': json.dumps({'start': '08:00', 'end': '18:00'})}
-    file_details_map = {}
-    for _, event in df.sort_values(by='timestamp').iterrows():
-        file_id = event['file_id']
-        if not file_id: continue
-        if file_id not in file_details_map:
-            file_details_map[file_id] = {'is_shared_externally': 0.0, 'vt_positives': 0.0}
-        if event['event_type'] == 'file_shared_externally':
-            file_details_map[file_id]['is_shared_externally'] = 1.0
-        if 'ransom' in str(event['attack_scenario']):
-            file_details_map[file_id]['vt_positives'] = 15.0
-    logger.info("Context simulation complete.")
-    return user_baselines, file_details_map
+def user_level_holdout_split(df: pd.DataFrame, test_size=0.25):
+    logger.info(f"Performing user-level holdout split (test_size={test_size})...")
+    users = df['actor_email'].dropna().unique()
+    np.random.seed(RANDOM_STATE)
+    holdout_users = np.random.choice(users, size=int(len(users) * test_size), replace=False)
+    
+    train_df = df[~df['actor_email'].isin(holdout_users)]
+    test_df = df[df['actor_email'].isin(holdout_users)]
+    
+    logger.info(f"Train set: {len(train_df)} events from {len(train_df['actor_email'].unique())} users.")
+    logger.info(f"Test set: {len(test_df)} events from {len(test_df['actor_email'].unique())} users (held out).")
+    return train_df, test_df
 
-def print_metrics(y_true, y_pred_proba, model_name: str, threshold=0.5):
-    y_pred_binary = (y_pred_proba >= threshold).astype(int)
-    precision, recall, f1, _ = precision_recall_fscore_support(y_true, y_pred_binary, average='binary', zero_division=0)
-    roc_auc = roc_auc_score(y_true, y_pred_proba)
-    pr_auc = average_precision_score(y_true, y_pred_proba)
-    logger.info(f"--- Metrics for {model_name} (at threshold {threshold:.2f}) ---")
-    print(f"  Precision: {precision:.4f}\n  Recall:    {recall:.4f}\n  F1-Score:  {f1:.4f}")
-    print(f"  AUC-ROC:   {roc_auc:.4f}\n  AUC-PR:    {pr_auc:.4f}")
-    print(f"  Confusion Matrix:\n{confusion_matrix(y_true, y_pred_binary)}")
-    logger.info("------------------------------------")
-
-
-# --- NEW: Optuna hyperparameter tuning for XGB ---
-def tune_xgb_with_optuna(X, y, n_trials=40):
-    def objective(trial):
-        params = {
-            "n_estimators": trial.suggest_int("n_estimators", 200, 600),
-            "max_depth": trial.suggest_int("max_depth", 3, 10),
-            "learning_rate": trial.suggest_loguniform("learning_rate", 1e-3, 0.3),
-            "subsample": trial.suggest_uniform("subsample", 0.6, 1.0),
-            "colsample_bytree": trial.suggest_uniform("colsample_bytree", 0.6, 1.0),
-            "gamma": trial.suggest_loguniform("gamma", 1e-8, 10.0),
-            "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
-            "use_label_encoder": False,
-            "eval_metric": "logloss",
-            "random_state": RANDOM_STATE,
-            "scale_pos_weight": y.value_counts().get(0, 1) / y.value_counts().get(1, 1)
-        }
-        clf = xgb.XGBClassifier(**params)
-        cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=RANDOM_STATE)
-        f1_scores = []
-        for train_idx, val_idx in cv.split(X, y):
-            X_tr, X_val = X.iloc[train_idx], X.iloc[val_idx]
-            y_tr, y_val = y.iloc[train_idx], y.iloc[val_idx]
-            clf.fit(X_tr, y_tr)
-            probs = clf.predict_proba(X_val)[:, 1]
-            precisions, recalls, thresholds = precision_recall_curve(y_val, probs)
-            f1s = 2 * (precisions * recalls) / (precisions + recalls + 1e-12)
-            f1_scores.append(np.nanmax(f1s))
-        return np.mean(f1_scores)
-
-    study = optuna.create_study(direction="maximize")
-    study.optimize(lambda t: objective(t), n_trials=n_trials)
-    logger.info(f"Best Optuna params: {study.best_trial.params}")
-    return study.best_trial.params
-
-
-def train_and_evaluate(df: pd.DataFrame):
-    logger.info("Starting model training and evaluation pipeline...")
+# --- 3. MODEL TRAINING & EVALUATION ---
+def train_and_evaluate():
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    
+    full_df = load_data(DATABASE_PATH)
+    if full_df is None: return
+    
+    train_df, test_df = user_level_holdout_split(full_df)
 
-    logger.info("Generating feature matrix using shared library...")
-    user_baselines, file_details_map = simulate_context_for_training(df)
-    X = generate_feature_matrix(df.copy(), user_baselines, file_details_map)
-    y = df.sort_values(by='timestamp')["is_malicious"].reset_index(drop=True)
+    logger.info("Generating feature matrix for the training set...")
+    X_train = generate_feature_matrix(train_df.copy())
+    y_train = train_df.sort_values('timestamp')['is_malicious'].reset_index(drop=True)
 
-    logger.info("Performing time-based split (80% train, 20% test)...")
-    split_index = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:split_index], X.iloc[split_index:]
-    y_train, y_test = y.iloc[:split_index], y.iloc[split_index:]
+    logger.info("Generating feature matrix for the test set...")
+    X_test = generate_feature_matrix(test_df.copy())
+    y_test = test_df.sort_values('timestamp')['is_malicious'].reset_index(drop=True)
+
+    # ------------------ START OF CRITICAL FIX ------------------
+    logger.info("Enforcing column consistency between train and test sets...")
+    train_cols = X_train.columns
+    
+    missing_in_test = set(train_cols) - set(X_test.columns)
+    for c in missing_in_test:
+        X_test[c] = 0
+        
+    missing_in_train = set(X_test.columns) - set(train_cols)
+    for c in missing_in_train:
+        X_train[c] = 0
+
+    # Enforce the exact same column order
+    X_test = X_test[train_cols]
+    # ------------------- END OF CRITICAL FIX -------------------
 
     # Hybrid feature (Isolation Forest score)
+    logger.info("Training Isolation Forest for hybrid feature...")
     iforest = IsolationForest(contamination="auto", random_state=RANDOM_STATE).fit(X_train)
-    X_train_hybrid = X_train.copy(); X_train_hybrid["iforest_score"] = -iforest.decision_function(X_train)
-    X_test_hybrid = X_test.copy(); X_test_hybrid["iforest_score"] = -iforest.decision_function(X_test)
+    X_train["iforest_score"] = -iforest.decision_function(X_train)
+    X_test["iforest_score"] = -iforest.decision_function(X_test)
+    
+    # The Isolation Forest adds a new column, so we need to get the final column list
+    final_train_cols = X_train.columns
+    X_test = X_test[final_train_cols] # Re-enforce order after adding the new feature
 
-    # Save training columns
-    final_training_columns = X_train_hybrid.columns.tolist()
-    with open(COLUMNS_OUTPUT_PATH, "w") as f: json.dump(final_training_columns, f, indent=4)
+    logger.info(f"Saving {len(final_train_cols)} training columns to {COLUMNS_OUTPUT_PATH}")
+    with open(COLUMNS_OUTPUT_PATH, "w") as f: json.dump(final_train_cols.tolist(), f, indent=4)
 
-    # --- Hyperparameter tuning with Optuna ---
-    best_params = tune_xgb_with_optuna(X_train_hybrid, y_train, n_trials=40)
-    clf = xgb.XGBClassifier(**best_params)
+    # Optuna tuning
+    def objective(trial):
+        params = {
+            "objective": "binary:logistic", "eval_metric": "aucpr",
+            "n_estimators": trial.suggest_int("n_estimators", 200, 1000, log=True),
+            "max_depth": trial.suggest_int("max_depth", 4, 10),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "scale_pos_weight": (len(y_train) - sum(y_train)) / sum(y_train) if sum(y_train) > 0 else 1
+        }
+        model = xgb.XGBClassifier(**params, random_state=RANDOM_STATE, use_label_encoder=False)
+        model.fit(X_train, y_train, verbose=False)
+        preds = model.predict_proba(X_test)[:, 1]
+        return average_precision_score(y_test, preds)
 
-    # --- Calibrate probabilities ---
-    calibrator = CalibratedClassifierCV(estimator=clf, method="isotonic", cv=3)
-    calibrator.fit(X_train_hybrid, y_train)
+    logger.info(f"Starting Optuna hyperparameter tuning ({OPTUNA_TRIALS} trials)...")
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=OPTUNA_TRIALS)
+    best_params = study.best_trial.params
+    
+    # Train final model with best params
+    logger.info("Training final XGBoost model with best parameters...")
+    final_model = xgb.XGBClassifier(**best_params, random_state=RANDOM_STATE, use_label_encoder=False)
+    final_model.fit(X_train, y_train) # Train on all train data
 
-    # --- Threshold tuning on test set ---
-    probs = calibrator.predict_proba(X_test_hybrid)[:, 1]
-    precisions, recalls, thresholds = precision_recall_curve(y_test, probs)
-    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-12)
-    best_idx = np.nanargmax(f1_scores)
-    best_thresh = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
+    # Probability Calibration
+    logger.info("Calibrating model probabilities...")
+    calibrated_model = CalibratedClassifierCV(estimator=final_model, method="isotonic", cv=3)
+    calibrated_model.fit(X_train, y_train)
 
-    logger.info(f"Best threshold for F1-score found at: {best_thresh:.2f}")
-    print_metrics(y_test, probs, "Tuned Hybrid XGBoost", threshold=best_thresh)
+    logger.info(f"Saving calibrated model to {MODEL_OUTPUT_PATH}")
+    joblib.dump(calibrated_model, MODEL_OUTPUT_PATH)
 
-    # Save model + threshold
-    joblib.dump({"model": calibrator, "threshold": best_thresh}, MODEL_OUTPUT_PATH)
+    # --- 4. REPORTING ---
+    logger.info("Generating evaluation report on user-level holdout set...")
+    y_pred_proba = calibrated_model.predict_proba(X_test)[:, 1]
+    
+    precisions, recalls, thresholds = precision_recall_curve(y_test, y_pred_proba)
+    # Add a small epsilon to the denominator to avoid division by zero
+    f1_scores = 2 * (precisions * recalls) / (precisions + recalls + 1e-9)
+    best_f1_idx = np.nanargmax(f1_scores)
+    best_threshold = thresholds[best_f1_idx]
+    y_pred_binary = (y_pred_proba >= best_threshold).astype(int)
 
-    # Feature importance (from underlying XGB, not calibrator)
-    all_importances = []
+    pr_auc = average_precision_score(y_test, y_pred_proba)
+    roc_auc = roc_auc_score(y_test, y_pred_proba)
+    precision, recall, f1, _ = precision_recall_fscore_support(y_test, y_pred_binary, average='binary')
 
-# Newer sklearn: has .estimators_
-    if hasattr(calibrator, "estimators_"):
-        fitted_models = calibrator.estimators_
-# Older sklearn: has .calibrated_classifiers_
-    elif hasattr(calibrator, "calibrated_classifiers_"):
-        fitted_models = [cc.estimator for cc in calibrator.calibrated_classifiers_]
-    else:
-        fitted_models = []
+    with open(REPORT_OUTPUT_PATH, "w") as f:
+        f.write("# Evaluation Report v2\n\n")
+        f.write(f"Generated on: {datetime.now().isoformat()}\n\n")
+        f.write("## Key Metrics (on User-Level Holdout Set)\n\n")
+        f.write("| Metric | Score |\n|---|---|\n")
+        f.write(f"| PR-AUC (Area Under PR Curve) | {pr_auc:.4f} |\n")
+        f.write(f"| ROC-AUC | {roc_auc:.4f} |\n")
+        f.write(f"| Best F1-Score | {f1:.4f} |\n")
+        f.write(f"| Precision (at best F1) | {precision:.4f} |\n")
+        f.write(f"| Recall (at best F1) | {recall:.4f} |\n")
+        f.write(f"| Optimal Threshold | {best_threshold:.4f} |\n\n")
+        f.write("## Confusion Matrix (at Optimal Threshold)\n\n```\n")
+        f.write(str(confusion_matrix(y_test, y_pred_binary)))
+        f.write("\n```\n\n")
+        f.write("## Best Hyperparameters (from Optuna)\n\n```json\n")
+        f.write(json.dumps(best_params, indent=2))
+        f.write("\n```\n")
+    logger.info(f"Evaluation report saved to {REPORT_OUTPUT_PATH}")
 
-    for est in fitted_models:
-        fitted_xgb = getattr(est, "base_estimator", est)
-        if hasattr(fitted_xgb, "feature_importances_"):
-            all_importances.append(fitted_xgb.feature_importances_)
+    display = PrecisionRecallDisplay.from_predictions(y_test, y_pred_proba, name="XGBoost_v2")
+    plt.title("Precision-Recall Curve (User-Level Holdout)")
+    plt.savefig(RESULTS_DIR / "pr_curve_v2.png")
+    logger.info("PR curve plot saved.")
+    
+    feature_importances = pd.Series(final_model.feature_importances_, index=final_train_cols).sort_values(ascending=False)
+    plt.figure(figsize=(10, 12))
+    sns.barplot(x=feature_importances.head(30), y=feature_importances.head(30).index)
+    plt.title("Top 30 Feature Importances (User-Level Holdout)")
+    plt.tight_layout()
+    plt.savefig(RESULTS_DIR / "feature_importance_v2.png")
+    logger.info("Feature importance plot saved.")
 
-    if all_importances:
-        avg_importances = np.mean(all_importances, axis=0)
-        feature_importances = pd.Series(avg_importances, index=final_training_columns).sort_values(ascending=False)
-
-        plt.figure(figsize=(10, 12))
-        sns.barplot(x=feature_importances.head(30), y=feature_importances.head(30).index)
-        plt.title("Top 30 Averaged Feature Importances for Tuned Hybrid Model")
-        plt.xlabel("Importance Score")
-        plt.tight_layout()
-        plt.savefig(RESULTS_DIR / "feature_importance_tuned.png")
-        plt.close()
-        logger.info("Averaged feature importance plot saved.")
-    else:
-        logger.warning("No feature importances found in fitted estimators.")
-
-
-
-def main():
-    df = load_data(DATABASE_PATH)
-    if df is not None:
-        train_and_evaluate(df)
 
 if __name__ == "__main__":
-    main()
+    train_and_evaluate()

@@ -1,4 +1,4 @@
-# app/guardian/service.py (FINAL, DE-COUPLED ARCHITECTURE)
+# app/guardian/service.py (FINAL, CORRECTED, AND ROBUST)
 
 import time
 from pathlib import Path
@@ -7,12 +7,13 @@ from pystray import Icon as icon, MenuItem as item
 from apscheduler.schedulers.background import BackgroundScheduler
 from plyer import notification
 from datetime import datetime
+import logging
+logger = logging.getLogger(__name__)
 
 from app.oauth.google_auth import get_credentials
 from app.drive.ingest import ingest_once
 from app.analysis.ntw import get_final_threat_score
 from app.analysis.baseline_analyzer import update_baseline
-# --- UPDATED: The scanner is now a top-level import ---
 from app.analysis.threat_scanner import scan_unscanned_files
 from app.db import dao
 
@@ -33,7 +34,6 @@ def run_learning_task():
     except Exception as e:  
         print(f"GUARDIAN: ERROR during learning task: {e}")
 
-# --- NEW: A dedicated, standalone task for the threat scanner ---
 def run_scanner_task():
     """A separate, scheduled task for the slow VirusTotal scanner."""
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running threat scanner at {time.strftime('%H:%M:%S')}...")
@@ -43,6 +43,51 @@ def run_scanner_task():
     except Exception as e:
         print(f"GUARDIAN: ERROR during scanner task: {e}")
 
+def run_analysis_once():
+    """
+    Scans all unprocessed events in the database ONE TIME, scores them,
+    and persists any detected narratives.
+    """
+    logger.info("--- Kicking off single analysis run ---")
+    
+    try:
+        with dao.get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # This is the same logic from the Guardian's loop
+            query = "SELECT e.*, f.name, f.mime_type FROM events e LEFT JOIN files f ON e.file_id = f.id WHERE e.is_analyzed = 0 ORDER BY e.ts ASC"
+            unprocessed_events = cursor.execute(query).fetchall()
+
+            if unprocessed_events:
+                logger.info(f"Found {len(unprocessed_events)} new events to analyze.")
+                for event_row in unprocessed_events:
+                    event_dict = dict(event_row)
+                    event_id = event_dict['id']
+                    
+                    # Call the main orchestrator
+                    result = get_final_threat_score(event_dict)
+
+                    # Mark the event as analyzed
+                    dao.update_event_analysis_status(cursor, event_id, 1)
+
+                    if result['threat_level'] in ['High', 'Critical']:
+                        logger.warning(f"High threat event detected! ID: {event_id}, Score: {result['final_score']:.2f}")
+                        if result.get('narrative_info'):
+                            logger.critical(f"*** NARRATIVE DETECTED AND SAVED: {result['narrative_info']['narrative_type']} ***")
+                        # You can re-enable notifications here if you want
+                        # send_notification(f"{result['threat_level']} Threat Detected!", f"Score: {result['final_score']:.0f}")
+
+                conn.commit()
+                logger.info("Analysis run complete. All changes committed.")
+            else:
+                logger.info("No new events to analyze.")
+
+    except Exception as e:
+        import traceback
+        logger.error(f"ERROR during analysis run: {e}")
+        traceback.print_exc()
+
+# --- END OF NEW FUNCTION ---
 
 def run_analysis_tasks():
     """
@@ -51,7 +96,6 @@ def run_analysis_tasks():
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running analysis suite at {time.strftime('%H:%M:%S')}...")
     try:
         with dao.get_db_connection() as conn:
-            # ... (The entire analysis logic remains the same) ...
             print("GUARDIAN: Analyzing new, unprocessed events...")
             cursor = conn.cursor()
             query = "SELECT e.*, f.name, f.mime_type, f.is_shared_externally, f.vt_positives, f.created_time, f.modified_time, ub.typical_activity_hours_json FROM events e LEFT JOIN files f ON e.file_id = f.id LEFT JOIN user_baseline ub ON e.actor_user_id = ub.user_id WHERE e.is_analyzed = 0"
@@ -64,27 +108,38 @@ def run_analysis_tasks():
                     event_id = event_dict['id']
                     result = get_final_threat_score(event_dict)
                     dao.update_event_analysis_status(cursor, event_id, 1)
+
+                    # --- >>> FIX IS HERE: Robust notification logic <<< ---
                     if result['threat_level'] in ['High', 'Critical']:
-                        bd = result['breakdown']; scores = {"Event Risk": bd['er_details']['score'],"Narrative Risk": bd['nr_details']['score'],"Contextual Risk": bd['cr_details']['score']}
-                        if 'mr_details' in bd: scores["ML Risk"] = bd['mr_details']['score']
-                        primary_category = max(scores, key=scores.get)
-                        if primary_category == "ML Risk": details_key = "mr_details"
-                        else: details_key = f"{primary_category.split()[0].lower()}_details"
-                        reasons_list = bd[details_key]['reasons']
-                        primary_reason = reasons_list[-1] if reasons_list else f"High {primary_category}"
-                        send_notification(f"{result['threat_level']} Threat Detected!", f"Score: {result['final_score']:.0f}/100. Reason: {primary_reason}")
+                        logic_tier = result['breakdown']['logic_tier']
+                        primary_reason = "No specific reason found."
+
+                        # Prioritize the narrative reason if it's the driver
+                        if logic_tier == "Narrative-Driven":
+                            reasons_list = result['breakdown']['nr_details']['reasons']
+                            if reasons_list:
+                                primary_reason = reasons_list[0]
+                        # Otherwise, use the event-driven reason
+                        else:
+                            reasons_list = result['breakdown']['er_details']['reasons']
+                            if reasons_list:
+                                # The last reason added is often the most significant
+                                primary_reason = reasons_list[-1]
+                        
+                        title = f"{result['threat_level']} Threat Detected ({logic_tier})"
+                        message = f"Score: {result['final_score']:.0f}/100. Reason: {primary_reason}"
+                        send_notification(title, message)
+                
                 conn.commit()
             else:
                 print("GUARDIAN: No new events to analyze.")
         
-        # --- REMOVED: The scanner is no longer called from here ---
         print("GUARDIAN: Analysis suite completed.")
     except Exception as e:
         import traceback
         print(f"GUARDIAN: ERROR during analysis task: {e}")
         traceback.print_exc()
 
-# --- send_notification, setup_tray_icon, on_exit are unchanged ---
 def send_notification(title, message):
     print(f"GUARDIAN: Sending notification: '{title}'")
     try:
@@ -113,12 +168,9 @@ scheduler = BackgroundScheduler()
 def start_guardian_service():
     print("GUARDIAN: Starting Argus Guardian Service...")
     
-    # --- UPDATED: Adjust the scanner schedule ---
-    # The scanner job now runs every minute. In each run, it processes a batch
-    # of up to 4 files, which respects the VirusTotal API limit.
     scheduler.add_job(run_ingestion_task, 'interval', minutes=1, id='ingestion_job')
     scheduler.add_job(run_analysis_tasks, 'interval', minutes=1, id='analysis_job')
-    scheduler.add_job(run_scanner_task, 'interval', minutes=1, id='scanner_job') # Changed from 30 seconds
+    scheduler.add_job(run_scanner_task, 'interval', minutes=1, id='scanner_job')
     scheduler.add_job(run_learning_task, 'cron', hour=2, id='learning_job')
     
     print("GUARDIAN: All jobs scheduled. Running initial tasks now...")

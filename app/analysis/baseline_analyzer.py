@@ -28,7 +28,7 @@ def update_baseline():
 
             cursor.execute("SELECT ts FROM events WHERE actor_user_id = ?", (user_id,))
             timestamps = cursor.fetchall()
-            hours = [datetime.fromisoformat(ts['ts']).hour for ts in timestamps]
+            hours = [ts['ts'].hour for ts in timestamps]
             
             if hours:
                 peak_hour = Counter(hours).most_common(1)[0][0]

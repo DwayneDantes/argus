@@ -1,0 +1,21 @@
+[
+    "hour_of_day",
+    "day_of_week",
+    "event_file_copied",
+    "event_file_created",
+    "event_file_downloaded",
+    "event_file_modified",
+    "event_file_moved",
+    "event_file_renamed",
+    "event_file_shared_externally",
+    "event_file_shared_internally",
+    "event_file_trashed",
+    "event_permission_changed",
+    "actor_copy_count_30m",
+    "actor_trash_count_30m",
+    "actor_external_share_count_15m",
+    "actor_download_count_30m",
+    "actor_archive_created_flag_10m",
+    "time_since_last_event_for_actor",
+    "iforest_score"
+]

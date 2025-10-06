@@ -1,124 +1,108 @@
-# app/analysis/narrative_builder.py (FINAL, CORRECTED VERSION)
+# app/analysis/narrative_builder.py (UPGRADED for Milestone 3.2)
 
-import re
-from datetime import datetime, timedelta
-from app.db import dao
-from app import config
+import logging
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
 
-# --- NARRATIVE 1: DATA EXFILTRATION (UPGRADED LOGIC) ---
-def analyze_exfiltration_by_obfuscation(event: dict, cursor) -> dict | None:
-    """
-    Detects a "Copy -> Rename -> Share" pattern. If found, returns a structured
-    dictionary representing the narrative hit. Otherwise, returns None.
-    """
-    if event.get('event_type') != 'file_shared_externally':
-        return None
+logger = logging.getLogger(__name__)
 
-    template = config.NARRATIVE_TEMPLATES['EXFILTRATION_V1']
-    time_window = timedelta(minutes=template['time_window_minutes'])
-    
-    shared_file_id = event['file_id']
-    sharing_actor_id = event['actor_user_id']
-    
-    # --- FIX: event['ts'] is now a datetime object, not a string ---
-    share_time = event['ts']
+# --- 1. Narrative Templates ---
+# In a real system, this would be loaded from a JSON/YAML file.
+NARRATIVE_TEMPLATES = {
+    "stage_archive_exfil_v1": {
+        "id": "stage_archive_exfil_v1",
+        "description": "Actor performs a high volume of copies, creates an archive, then shares it externally.",
+        "starter_patterns": ["bulk_copy"], # Which micro-patterns can start this narrative
+        "ordered_steps": [
+            {'type': 'bulk_copy'},
+            {'type': 'archive_create'},
+            {'type': 'external_share'}
+        ],
+        "total_time_window_minutes": 120,
+        "base_score": 75.0,
+        "reason": "NR: Detected a staged data exfiltration pattern (Bulk Copy -> Archive -> Share)."
+    }
+}
 
-    history = dao.get_file_event_history(cursor, shared_file_id)
-    if not history:
-        return None
+# --- 2. State Management for Active FSMs ---
+# Maps: actor_id -> list of active FSM instances for that actor
+ACTIVE_FSMS = defaultdict(list)
 
-    creation_event = dict(history[0])
-    
-    # --- FIX: creation_event['ts'] is also a datetime object ---
-    creation_time = creation_event['ts']
+# --- 3. The FSM Class ---
+class NarrativeFSM:
+    """An instance of a potential narrative being tracked for a single actor."""
+    def __init__(self, template: dict, actor_id: str):
+        self.template = template
+        self.actor_id = actor_id
+        self.state = 0  # Current step in the narrative we are looking for
+        self.start_time = datetime.now(timezone.utc)
+        self.last_advance_time = self.start_time
+        self.evidence = {} # Maps step type to the micro-pattern data
 
-    if (share_time - creation_time) > time_window:
-        return None
+    def advance(self, micro_pattern_type: str, micro_pattern_data: dict):
+        """Attempts to advance the FSM's state with a new micro-pattern."""
+        if self.state >= len(self.template['ordered_steps']):
+            return "ALREADY_COMPLETE" # Should not happen if managed correctly
 
-    score = 0.0
-    contributing_events = []
-    stages_found = []
-    
-    if creation_event['event_type'] == 'file_copied':
-        score += template['stage_weights']['copied']
-        stages_found.append('copied')
-        contributing_events.append({'event_id': creation_event['id'], 'stage': 'copied'})
-
-    for history_event_row in history:
-        history_event = dict(history_event_row)
+        expected_step = self.template['ordered_steps'][self.state]
         
-        # --- FIX: history_event['ts'] is also a datetime object ---
-        event_time = history_event['ts']
-        
-        if (history_event['event_type'] == 'file_renamed' and 
-            history_event['actor_user_id'] == sharing_actor_id and
-            creation_time < event_time < share_time):
+        if micro_pattern_type == expected_step['type']:
+            self.state += 1
+            self.evidence[micro_pattern_type] = micro_pattern_data
+            self.last_advance_time = datetime.now(timezone.utc)
             
-            score += template['stage_weights']['renamed']
-            stages_found.append('renamed')
-            contributing_events.append({'event_id': history_event['id'], 'stage': 'renamed'})
+            if self.state == len(self.template['ordered_steps']):
+                return "COMPLETE"
+            return "ADVANCED"
+        return "NO_MATCH"
+
+    def is_expired(self) -> bool:
+        """Checks if the FSM has exceeded its total allowed lifetime."""
+        return (datetime.now(timezone.utc) - self.start_time).total_seconds() > (self.template['total_time_window_minutes'] * 60)
+
+# --- 4. The Main Analysis Function ---
+def analyze_narratives_for_actor(actor_id: str, micro_patterns: dict) -> dict | None:
+    """
+    Manages the lifecycle of FSMs for a given actor and checks for completed narratives.
+    """
+    completed_narrative = None
+
+    # --- Step A: Prune expired FSMs ---
+    ACTIVE_FSMS[actor_id] = [fsm for fsm in ACTIVE_FSMS[actor_id] if not fsm.is_expired()]
+
+    # --- Step B: Advance all active FSMs with newly detected patterns ---
+    for fsm in ACTIVE_FSMS[actor_id]:
+        for pattern_type, pattern_data in micro_patterns.items():
+            result = fsm.advance(pattern_type, pattern_data)
+            if result == "COMPLETE":
+                logger.info(f"NARRATIVE DETECTED for actor {actor_id}: {fsm.template['id']}")
+                completed_narrative = {
+                    "narrative_type": fsm.template['id'],
+                    "score": fsm.template['base_score'],
+                    "reason": fsm.template['reason'],
+                    "evidence": fsm.evidence,
+                    "primary_actor_id": fsm.actor_id,
+                    "start_time": fsm.start_time.isoformat(),
+                    "end_time": datetime.now(timezone.utc).isoformat()
+                }
+                break
+        if completed_narrative:
             break
 
-    score += template['stage_weights']['shared']
-    stages_found.append('shared')
-    contributing_events.append({'event_id': event['id'], 'stage': 'shared'})
-    
-    if 'copied' in stages_found and 'renamed' in stages_found:
-        reason = (f"NR: High-confidence exfiltration pattern detected on file {shared_file_id} "
-                  f"(Copy -> Rename -> Share sequence within {time_window}).")
-        
-        return {
-            "narrative_type": "EXFILTRATION_V1",
-            "score": score,
-            "reason": reason,
-            "contributing_events": contributing_events,
-            "primary_actor_id": sharing_actor_id,
-            "start_time": creation_time.isoformat(),
-            "end_time": share_time.isoformat()
-        }
+    # --- Step C: Instantiate NEW FSMs if a "starter" pattern is seen ---
+    # This must be done AFTER advancing, to avoid advancing a new FSM with the same pattern that started it.
+    for pattern_type, pattern_data in micro_patterns.items():
+        for template_name, template in NARRATIVE_TEMPLATES.items():
+            if pattern_type in template.get("starter_patterns", []):
+                is_already_running = any(fsm.template['id'] == template_name for fsm in ACTIVE_FSMS[actor_id])
+                if not is_already_running:
+                    logger.info(f"Instantiating new FSM '{template_name}' for actor {actor_id}")
+                    new_fsm = NarrativeFSM(template, actor_id)
+                    new_fsm.advance(pattern_type, pattern_data) # Advance with the starter pattern
+                    ACTIVE_FSMS[actor_id].append(new_fsm)
 
-    return None
+    # Clean up completed FSMs after they have fired
+    if completed_narrative:
+        ACTIVE_FSMS[actor_id] = [fsm for fsm in ACTIVE_FSMS[actor_id] if fsm.state < len(fsm.template['ordered_steps'])]
 
-
-# --- LEGACY NARRATIVES (Unchanged until they are upgraded) ---
-# NOTE: The ransomware function is also fixed to accept a datetime object.
-
-def analyze_mass_deletion_for_user(cursor, user_id: str) -> tuple[float, list[str]]:
-    score = 0.0; reasons = []; baseline = dao.get_user_baseline(cursor, user_id)
-    if not baseline: return 0.0, []
-    cursor.execute("SELECT COUNT(*) as deletion_count FROM events WHERE actor_user_id = ? AND event_type IN ('file_trashed', 'file_deleted_permanently') AND ts >= datetime('now', '-1 hours')", (user_id,))
-    bursts = cursor.fetchall()
-    if not bursts: return 0.0, []
-    max_baseline = baseline['max_historical_deletions']
-    for burst in bursts:
-        count = burst['deletion_count']
-        if count > 20 or (count > max_baseline * 2 and count > 5):
-            score += config.NARRATIVE_BASE_SCORES['mass_deletion']
-            reasons.append(f"NR: Mass Deletion detected ({count} files deleted).")
-    return score, reasons
-
-def analyze_ransomware_footprint(cursor, user_id: str, event_ts: datetime) -> tuple[float, list[str]]:
-    score = 0.0; reasons = []
-    # --- FIX: The input is now a datetime object ---
-    event_dt = event_ts
-    start_ts = (event_dt - timedelta(minutes=30)).isoformat()
-    end_ts = (event_dt + timedelta(minutes=30)).isoformat()
-    
-    pattern = r'\.(locked|crypted|encrypted|kraken|onion|\[\w+\])$'; note_pattern = r'^(readme|recover|decrypt|help).*\.(txt|html)$'
-    cursor.execute("SELECT file_id, event_type, name FROM events e LEFT JOIN files f ON e.file_id = f.id WHERE e.actor_user_id = ? AND e.ts >= ? AND e.ts <= ?", (user_id, start_ts, end_ts))
-    activity = cursor.fetchall()
-    if not activity: return 0.0, []
-    modified = set(); renamed = set(); note_found = False
-    for event in activity:
-        if event['event_type'] == 'file_modified': modified.add(event['file_id'])
-        elif event['event_type'] == 'file_renamed' and event['name']:
-            if re.search(pattern, event['name'], re.IGNORECASE): renamed.add(event['file_id'])
-        elif event['event_type'] == 'file_created' and event['name']:
-            if re.search(note_pattern, event['name'], re.IGNORECASE): note_found = True
-    points = 0; encrypted_count = len(modified.intersection(renamed))
-    if encrypted_count > 5:
-        points += 15; reasons.append(f"NR: Detected {encrypted_count} files modified then renamed to a ransom extension.")
-    if note_found:
-        points += 10; reasons.append("NR: A file matching a common ransom note name was also created.")
-    if points >= 15: score = config.NARRATIVE_BASE_SCORES['ransomware_footprint']
-    return score, reasons
+    return completed_narrative

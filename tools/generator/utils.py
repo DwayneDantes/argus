@@ -2,6 +2,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 import random
+import math
 
 def create_event_from_template(
     template_event: dict,
@@ -43,6 +44,12 @@ def create_event_from_template(
     new_event['attack_scenario'] = attack_id
     new_event['attack_role'] = attack_role
 
+
+    # Set ground-truth labels, allowing overrides
+    new_event['is_malicious'] = overrides.get('is_malicious', 1) # Default to 1 if not specified
+    new_event['attack_scenario'] = attack_id
+    new_event['attack_role'] = attack_role
+
     # Forge a basic details_json if not provided in overrides.
     # This ensures the column is always present.
     if 'details_json' not in new_event or not new_event['details_json']:
@@ -50,6 +57,24 @@ def create_event_from_template(
 
     return new_event
 
-def get_random_time_offset(min_seconds: int, max_seconds: int, rng: random.Random) -> timedelta:
-    """Returns a timedelta with a random number of seconds between min and max."""
-    return timedelta(seconds=rng.randint(min_seconds, max_seconds))
+def get_random_time_offset(mean_seconds: int, sigma: float, rng: random.Random) -> timedelta:
+    """
+    Returns a timedelta sampled from a Log-Normal distribution.
+    This models behavior where most delays are short, but some are very long.
+    
+    Args:
+        mean_seconds: The desired median delay in seconds.
+        sigma: Controls the spread/variance. A good starting value is 0.5 to 1.0.
+        rng: The random number generator instance.
+
+    Returns:
+        A timedelta object.
+    """
+    # lognormvariate takes mu (the mean of the underlying log) and sigma.
+    # We convert our desired median (mean_seconds) to the required mu parameter.
+    mu = math.log(mean_seconds)
+    
+    delay_seconds = rng.lognormvariate(mu, sigma)
+    
+    # Ensure the delay is at least 1 second to avoid zero-delay events
+    return timedelta(seconds=max(1, int(delay_seconds)))

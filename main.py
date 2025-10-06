@@ -26,6 +26,11 @@ def main():
     parser.add_argument("--start-api", action="store_true", help="Start the FastAPI server for the Argus API.")
     parser.add_argument("--scan-for-threats", action="store_true", help="Scan files against VirusTotal.")
     parser.add_argument("--train-model",action="store_true",help="Train the ML anomaly detection model on all historical data.")
+    parser.add_argument(
+        "--scan-everything", 
+        action="store_true", 
+        help="Run a one-time analysis of all unprocessed events and save detected narratives."
+    )
     
     args = parser.parse_args()
 
@@ -45,11 +50,29 @@ def main():
         from app.oauth.google_auth import get_credentials
         from app.drive.ingest import scan_all_files, ingest_once
         creds = get_credentials()
+        
         if args.scan_all:
+            # --- START OF IMPROVED WORKFLOW ---
+            # Step 1: Ingest all historical data
+            print("\n--- [PHASE 1/3] Starting Full Drive Scan ---")
             scan_all_files(creds)
+            print("\n--- [PHASE 1/3] Full Drive Scan Complete ---")
+
+            # Step 2: Automatically learn the baseline from the data we just ingested
+            print("\n--- [PHASE 2/3] Learning User Behavioral Baseline ---")
+            from app.analysis.baseline_analyzer import update_baseline
+            update_baseline()
+            print("\n--- [PHASE 2/3] Baseline Learning Complete ---")
+
+            # Step 3: Automatically scan all the ingested events for threats
+            print("\n--- [PHASE 3/3] Scanning All Events for Threats ---")
+            from app.guardian.service import run_analysis_once
+            run_analysis_once()
+            print("\n--- [PHASE 3/3] Threat Scan Complete ---")
+            # --- END OF IMPROVED WORKFLOW ---
         else:
+            # The --ingest-once command remains a simple, single operation
             ingest_once(creds)
-    
     elif args.learn_baseline:
         from app.analysis.baseline_analyzer import update_baseline
         update_baseline()
@@ -69,6 +92,10 @@ def main():
         print("Starting Argus FastAPI server...")
         print("API Documentation will be available at http://127.0.0.1:8000/docs")
         uvicorn.run("app.api:app", host="127.0.0.1", port=8000, reload=True)
+    elif args.scan_everything:
+        from app.guardian.service import run_analysis_once
+        run_analysis_once()
+    
     
     else:
         # Check if any other argument was passed. If not, print help.
