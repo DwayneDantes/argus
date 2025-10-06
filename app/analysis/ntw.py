@@ -1,4 +1,4 @@
-# app/analysis/ntw.py (FINAL INTEGRATED VERSION for Sprint 3)
+# app/analysis/ntw.py (COMPLETELY FIXED - No Database Locking)
 
 import math
 import logging
@@ -11,7 +11,6 @@ from app import config
 
 logger = logging.getLogger(__name__)
 
-# --- Helper functions for scoring logic ---
 def _sigmoid(x):
     return 1 / (1 + math.exp(-x))
 
@@ -32,69 +31,99 @@ def _calculate_blended_base_score(er_score, nr_score) -> tuple[float, str]:
         
     return base_score, tier
 
-# --- The Main Orchestration Function ---
 def get_final_threat_score(event: dict) -> dict:
     """
     Orchestrates the full four-layer analysis pipeline for a single event.
+    FIXED: Does all scoring WITHOUT database writes, then saves narrative separately.
     """
-    with dao.get_db_connection() as conn:
-        cursor = conn.cursor()
-        conn.execute("BEGIN")
+    narrative_id = None
+    
+    try:
+        # All scoring happens WITHOUT database transactions
+        # Layer 1: Heuristic Risk
+        er_heuristic_score, er_reasons, er_tags = calculate_heuristic_risk_score(None, event)
+        
+        # Layer 2: Contextual Risk (in-memory only)
+        micro_pattern_features = update_and_compute_micro_patterns(event)
+        
+        # Layer 3: Narrative Risk (in-memory FSM)
+        completed_narrative = analyze_narratives_for_actor(
+            event.get('actor_user_id'), 
+            micro_pattern_features,
+            event.get('id')
+        )
+        
+        if completed_narrative:
+            nr_score = completed_narrative.get('score', 0.0)
+            nr_reasons = [completed_narrative.get('reason', "Matched a known threat narrative.")]
+        else:
+            nr_score = 0.0
+            nr_reasons = []
 
-        try:
-            # --- Logic up to final scoring (no changes here) ---
-            er_heuristic_score, er_reasons, er_tags = calculate_heuristic_risk_score(cursor, event)
-            micro_pattern_features = update_and_compute_micro_patterns(event)
-            completed_narrative = analyze_narratives_for_actor(event.get('actor_user_id'), micro_pattern_features)
-            
-            if completed_narrative:
-                nr_score = completed_narrative.get('score', 0.0)
-                nr_reasons = [completed_narrative.get('reason', "Matched a known threat narrative.")]
-                narrative_id = dao.create_narrative(cursor, completed_narrative)
-                logger.info(f"Successfully registered new narrative '{completed_narrative['narrative_type']}' with ID: {narrative_id}")
-            else:
-                nr_score = 0.0
-                nr_reasons = []
+        # Layer 4: ML Risk
+        ml_probability = calculate_ml_risk_score(None, event, micro_pattern_features)
+        
+        ml_reasons = []
+        if ml_probability >= config.SUPERVISED_ML_CONFIG['prosecutor_min_confidence']:
+            er_ml_score = ml_probability * config.SUPERVISED_ML_CONFIG['score_mapping_slope']
+            ml_reasons.append(f"ML Model detected a behavioral threat (Confidence: {ml_probability:.2%})")
+            er_tags.append("ML_BEHAVIORAL_THREAT")
+        else:
+            er_ml_score = 0.0
 
-            ml_probability = calculate_ml_risk_score(cursor, event, micro_pattern_features)
-            
-            ml_reasons = []
-            if ml_probability >= config.SUPERVISED_ML_CONFIG['prosecutor_min_confidence']:
-                er_ml_score = ml_probability * config.SUPERVISED_ML_CONFIG['score_mapping_slope']
-                ml_reasons.append(f"ML Model detected a behavioral threat (Confidence: {ml_probability:.2%})")
-                er_tags.append("ML_BEHAVIORAL_THREAT")
-            else:
-                er_ml_score = 0.0
+        # Combine ER scores
+        er_score = max(er_heuristic_score, er_ml_score)
+        if er_ml_score > er_heuristic_score:
+            er_reasons.extend(ml_reasons)
+        
+        # Calculate final score
+        if completed_narrative:
+            base_threat_score = nr_score
+            logic_tier = "Narrative-Driven"
+        else:
+            base_threat_score, logic_tier = _calculate_blended_base_score(er_score, nr_score)
+        
+        total_amplifier_bonus = 0.0
+        final_score = base_threat_score * (1 + total_amplifier_bonus)
+        final_score = min(final_score, 100.0)
+        
+        # NOW persist the narrative in a SEPARATE connection
+        if completed_narrative:
+            try:
+                with dao.get_db_connection() as narrative_conn:
+                    narrative_cursor = narrative_conn.cursor()
+                    
+                    narrative_id = dao.create_narrative(narrative_cursor, completed_narrative)
+                    logger.info(f"SUCCESS: Narrative '{completed_narrative['narrative_type']}' saved with ID: {narrative_id}")
+                    
+                    events_with_stages = completed_narrative.get('event_ids', [])
+                    if not events_with_stages:
+                        events_with_stages = [{
+                            'event_id': event.get('id'),
+                            'stage': 'final_step'
+                        }]
+                    
+                    if events_with_stages:
+                        dao.link_events_to_narrative(narrative_cursor, narrative_id, events_with_stages)
+                        logger.info(f"SUCCESS: Linked {len(events_with_stages)} events to narrative {narrative_id}")
+                    
+                    narrative_conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to save narrative: {e}", exc_info=True)
+                # Don't fail the whole scoring - we still return the score
 
-            er_score = max(er_heuristic_score, er_ml_score)
-            if er_ml_score > er_heuristic_score:
-                er_reasons.extend(ml_reasons)
-            
-            if completed_narrative:
-                base_threat_score = nr_score
-                logic_tier = "Narrative-Driven"
-            else:
-                base_threat_score, logic_tier = _calculate_blended_base_score(er_score, nr_score)
-            
-            total_amplifier_bonus = 0.0
-            final_score = base_threat_score * (1 + total_amplifier_bonus)
-            final_score = min(final_score, 100.0)
-            
-            conn.commit()
+        logger.debug(f"Event {event.get('id')} scored: {final_score:.2f} ({logic_tier})")
 
-        except Exception as e:
-            logger.error(f"Error during threat scoring for event ID {event.get('id')}. Rolling back. Error: {e}", exc_info=True)
-            conn.rollback()
-            raise
+    except Exception as e:
+        logger.error(f"Error during threat scoring for event ID {event.get('id')}: {e}", exc_info=True)
+        raise
 
-    # --- >>> FIX IS HERE: Final Threat Level Assignment with Policy Enforcement <<< ---
+    # Threat level assignment
     threat_level = "Low"
     if final_score >= 70:
-        # A score in the critical range is only labeled 'Critical' if it is narrative-driven.
         if logic_tier == "Narrative-Driven":
             threat_level = "Critical"
         else:
-            # Otherwise, we cap the alert level at 'High' as per system policy.
             threat_level = "High" 
     elif final_score >= 40:
         threat_level = "High"
@@ -112,21 +141,18 @@ def get_final_threat_score(event: dict) -> dict:
             "er_details": {"score": er_score, "reasons": er_reasons},
             "nr_details": {"score": nr_score, "reasons": nr_reasons},
         },
-        "narrative_info": completed_narrative
+        "narrative_info": completed_narrative,
+        "narrative_id": narrative_id
     }
     return output
 
 def test_scoring_harness():
-    """
-    A simple command-line harness to test the full scoring pipeline on the most
-    recent events in the database.
-    """
+    """A simple command-line harness to test the full scoring pipeline."""
     print("\n--- Running Scoring Harness on Recent Events ---")
     
     with dao.get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Query for the 3 most recent events that have an actor
         query = """
             SELECT e.*, f.name, f.mime_type
             FROM events e 
@@ -144,7 +170,7 @@ def test_scoring_harness():
         print(f"Found {len(recent_events)} events to score...\n")
 
         for event_row in recent_events:
-            event_dict = dict(event_row) # Convert the sqlite3.Row to a regular dictionary
+            event_dict = dict(event_row)
             
             print("="*80)
             print(f"Scoring Event ID: {event_dict['id']} | Type: {event_dict['event_type']} | Actor: {event_dict['actor_user_id']}")
@@ -152,10 +178,8 @@ def test_scoring_harness():
             print("-"*80)
 
             try:
-                # Call the main orchestrator function
                 result = get_final_threat_score(event_dict)
                 
-                # Print a clean summary of the results
                 print(f"  >>> FINAL SCORE: {result['final_score']:.2f}/100  (Threat Level: {result['threat_level']})")
                 print(f"      Logic Tier: {result['breakdown']['logic_tier']}")
                 
@@ -173,6 +197,7 @@ def test_scoring_harness():
                 if result.get('narrative_info'):
                     print("\n      *** NARRATIVE DETECTED ***")
                     print(f"      - Type: {result['narrative_info']['narrative_type']}")
+                    print(f"      - Narrative ID: {result.get('narrative_id')}")
 
             except Exception as e:
                 print(f"\n      *** ERROR DURING SCORING ***")

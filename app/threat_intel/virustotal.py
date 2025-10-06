@@ -1,40 +1,51 @@
-# app/threat_intel/virustotal.py (Updated to use .env)
+# app/threat_intel/virustotal.py (FIXED - Quieter 404 Handling)
 
 import requests
 import time
 import os
 from dotenv import load_dotenv
 
-# This line will find the .env file in your project root and load its variables
 load_dotenv()
 
-# Read the API key from the environment variables
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY")
-
-# The base URL for the VirusTotal API v3
 VT_API_URL = "https://www.virustotal.com/api/v3/files/"
 
 def get_hash_report(file_hash: str) -> dict | None:
     """
-    Fetches a file hash report from the VirusTotal API using a key from .env.
+    Fetches a file hash report from the VirusTotal API.
+    Returns None if file not found (404) - this is normal and expected.
     """
     if not VIRUSTOTAL_API_KEY or VIRUSTOTAL_API_KEY == "PASTE_YOUR_API_KEY_HERE":
-        print("  - WARNING: VIRUSTOTAL_API_KEY not found in .env file. Skipping threat intelligence scan.")
+        # Only print this warning once per session
+        if not hasattr(get_hash_report, '_warned'):
+            print("  - WARNING: VIRUSTOTAL_API_KEY not configured. Skipping threat scans.")
+            get_hash_report._warned = True
         return None
 
     url = f"{VT_API_URL}{file_hash}"
-    headers = { "x-apikey": VIRUSTOTAL_API_KEY }
+    headers = {"x-apikey": VIRUSTOTAL_API_KEY}
 
     try:
         response = requests.get(url, headers=headers)
         
-        if response.status_code == 429: # Too Many Requests
-            print("  - VirusTotal rate limit exceeded. Waiting 60 seconds...")
+        # 404 is normal - file not in VT database. Don't print error.
+        if response.status_code == 404:
+            return None
+        
+        # Rate limiting
+        if response.status_code == 429:
+            print("  - VirusTotal rate limit hit. Waiting 60 seconds...")
             time.sleep(60)
             response = requests.get(url, headers=headers)
-
+        
         response.raise_for_status()
         return response.json()
+        
+    except requests.exceptions.HTTPError as e:
+        # Only log non-404 HTTP errors
+        if e.response.status_code != 404:
+            print(f"  - ERROR: VirusTotal API error for {file_hash}: {e}")
+        return None
     except requests.exceptions.RequestException as e:
-        print(f"  - ERROR: Could not get VirusTotal report for hash {file_hash}: {e}")
+        print(f"  - ERROR: Network error accessing VirusTotal: {e}")
         return None

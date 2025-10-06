@@ -1,4 +1,4 @@
-# app/analysis/narrative_builder.py (UPGRADED for Milestone 3.2)
+# app/analysis/narrative_builder.py (IMPROVED - Tracks Event IDs)
 
 import logging
 from collections import defaultdict
@@ -6,13 +6,11 @@ from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
 
-# --- 1. Narrative Templates ---
-# In a real system, this would be loaded from a JSON/YAML file.
 NARRATIVE_TEMPLATES = {
     "stage_archive_exfil_v1": {
         "id": "stage_archive_exfil_v1",
         "description": "Actor performs a high volume of copies, creates an archive, then shares it externally.",
-        "starter_patterns": ["bulk_copy"], # Which micro-patterns can start this narrative
+        "starter_patterns": ["bulk_copy"],
         "ordered_steps": [
             {'type': 'bulk_copy'},
             {'type': 'archive_create'},
@@ -24,31 +22,39 @@ NARRATIVE_TEMPLATES = {
     }
 }
 
-# --- 2. State Management for Active FSMs ---
-# Maps: actor_id -> list of active FSM instances for that actor
 ACTIVE_FSMS = defaultdict(list)
 
-# --- 3. The FSM Class ---
 class NarrativeFSM:
     """An instance of a potential narrative being tracked for a single actor."""
     def __init__(self, template: dict, actor_id: str):
         self.template = template
         self.actor_id = actor_id
-        self.state = 0  # Current step in the narrative we are looking for
+        self.state = 0
         self.start_time = datetime.now(timezone.utc)
         self.last_advance_time = self.start_time
-        self.evidence = {} # Maps step type to the micro-pattern data
+        self.evidence = {}
+        self.event_ids = []
 
-    def advance(self, micro_pattern_type: str, micro_pattern_data: dict):
-        """Attempts to advance the FSM's state with a new micro-pattern."""
+    def advance(self, micro_pattern_type: str, micro_pattern_data: dict, event_id: int = None):
+        """
+        Attempts to advance the FSM's state with a new micro-pattern.
+        Now also tracks the event ID that triggered this step.
+        """
         if self.state >= len(self.template['ordered_steps']):
-            return "ALREADY_COMPLETE" # Should not happen if managed correctly
+            return "ALREADY_COMPLETE"
 
         expected_step = self.template['ordered_steps'][self.state]
         
         if micro_pattern_type == expected_step['type']:
             self.state += 1
             self.evidence[micro_pattern_type] = micro_pattern_data
+            
+            if event_id:
+                self.event_ids.append({
+                    'event_id': event_id,
+                    'stage': micro_pattern_type
+                })
+            
             self.last_advance_time = datetime.now(timezone.utc)
             
             if self.state == len(self.template['ordered_steps']):
@@ -58,24 +64,36 @@ class NarrativeFSM:
 
     def is_expired(self) -> bool:
         """Checks if the FSM has exceeded its total allowed lifetime."""
-        return (datetime.now(timezone.utc) - self.start_time).total_seconds() > (self.template['total_time_window_minutes'] * 60)
+        elapsed_seconds = (datetime.now(timezone.utc) - self.start_time).total_seconds()
+        max_seconds = self.template['total_time_window_minutes'] * 60
+        return elapsed_seconds > max_seconds
 
-# --- 4. The Main Analysis Function ---
-def analyze_narratives_for_actor(actor_id: str, micro_patterns: dict) -> dict | None:
+def analyze_narratives_for_actor(actor_id: str, micro_patterns: dict, current_event_id: int = None) -> dict | None:
     """
     Manages the lifecycle of FSMs for a given actor and checks for completed narratives.
+    NOW ACCEPTS: current_event_id to track which events are part of narratives.
     """
     completed_narrative = None
+    
+    if micro_patterns:
+        pattern_types = list(micro_patterns.keys())
+        logger.info(f"[ANALYZE] Actor {actor_id} with patterns: {pattern_types}")
 
-    # --- Step A: Prune expired FSMs ---
+    before_prune = len(ACTIVE_FSMS[actor_id])
     ACTIVE_FSMS[actor_id] = [fsm for fsm in ACTIVE_FSMS[actor_id] if not fsm.is_expired()]
+    after_prune = len(ACTIVE_FSMS[actor_id])
+    if before_prune > after_prune:
+        logger.info(f"🧹 Pruned {before_prune - after_prune} expired FSMs for actor {actor_id}")
 
-    # --- Step B: Advance all active FSMs with newly detected patterns ---
     for fsm in ACTIVE_FSMS[actor_id]:
+        total_steps = len(fsm.template['ordered_steps'])
+        logger.debug(f"  FSM '{fsm.template['id']}' at step {fsm.state}/{total_steps}")
         for pattern_type, pattern_data in micro_patterns.items():
-            result = fsm.advance(pattern_type, pattern_data)
+            result = fsm.advance(pattern_type, pattern_data, current_event_id)
+            if result == "ADVANCED":
+                logger.info(f"  ⏩ FSM '{fsm.template['id']}' advanced to step {fsm.state}")
             if result == "COMPLETE":
-                logger.info(f"NARRATIVE DETECTED for actor {actor_id}: {fsm.template['id']}")
+                logger.info(f"🎯 NARRATIVE DETECTED for actor {actor_id}: {fsm.template['id']}")
                 completed_narrative = {
                     "narrative_type": fsm.template['id'],
                     "score": fsm.template['base_score'],
@@ -83,26 +101,30 @@ def analyze_narratives_for_actor(actor_id: str, micro_patterns: dict) -> dict | 
                     "evidence": fsm.evidence,
                     "primary_actor_id": fsm.actor_id,
                     "start_time": fsm.start_time.isoformat(),
-                    "end_time": datetime.now(timezone.utc).isoformat()
+                    "end_time": datetime.now(timezone.utc).isoformat(),
+                    "event_ids": fsm.event_ids
                 }
                 break
         if completed_narrative:
             break
 
-    # --- Step C: Instantiate NEW FSMs if a "starter" pattern is seen ---
-    # This must be done AFTER advancing, to avoid advancing a new FSM with the same pattern that started it.
     for pattern_type, pattern_data in micro_patterns.items():
         for template_name, template in NARRATIVE_TEMPLATES.items():
             if pattern_type in template.get("starter_patterns", []):
-                is_already_running = any(fsm.template['id'] == template_name for fsm in ACTIVE_FSMS[actor_id])
+                is_already_running = any(
+                    fsm.template['id'] == template_name 
+                    for fsm in ACTIVE_FSMS[actor_id]
+                )
                 if not is_already_running:
-                    logger.info(f"Instantiating new FSM '{template_name}' for actor {actor_id}")
+                    logger.info(f"📍 Starting new narrative tracker '{template_name}' for actor {actor_id}")
                     new_fsm = NarrativeFSM(template, actor_id)
-                    new_fsm.advance(pattern_type, pattern_data) # Advance with the starter pattern
+                    new_fsm.advance(pattern_type, pattern_data, current_event_id)
                     ACTIVE_FSMS[actor_id].append(new_fsm)
 
-    # Clean up completed FSMs after they have fired
     if completed_narrative:
-        ACTIVE_FSMS[actor_id] = [fsm for fsm in ACTIVE_FSMS[actor_id] if fsm.state < len(fsm.template['ordered_steps'])]
+        ACTIVE_FSMS[actor_id] = [
+            fsm for fsm in ACTIVE_FSMS[actor_id] 
+            if fsm.state < len(fsm.template['ordered_steps'])
+        ]
 
     return completed_narrative

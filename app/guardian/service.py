@@ -1,4 +1,4 @@
-# app/guardian/service.py (FINAL, CORRECTED, AND ROBUST)
+# app/guardian/service.py (FIXED - Database Locking & Scheduling Issues)
 
 import time
 from pathlib import Path
@@ -8,6 +8,8 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from plyer import notification
 from datetime import datetime
 import logging
+import sqlite3
+
 logger = logging.getLogger(__name__)
 
 from app.oauth.google_auth import get_credentials
@@ -17,44 +19,77 @@ from app.analysis.baseline_analyzer import update_baseline
 from app.analysis.threat_scanner import scan_unscanned_files
 from app.db import dao
 
+# CRITICAL FIX: Prevent tasks from running simultaneously
+task_lock = {"ingestion": False, "analysis": False, "scanner": False, "learning": False}
+
 def run_ingestion_task():
+    if task_lock["ingestion"]:
+        print("GUARDIAN: Ingestion task already running, skipping this cycle.")
+        return
+    
+    task_lock["ingestion"] = True
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running data ingestion at {time.strftime('%H:%M:%S')}...")
     try:
         creds = get_credentials()
         ingest_once(creds)
         print("GUARDIAN: Ingestion task completed.")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e):
+            print("GUARDIAN: Database temporarily locked, will retry next cycle.")
+        else:
+            print(f"GUARDIAN: Database error during ingestion: {e}")
     except Exception as e:
         print(f"GUARDIAN: ERROR during ingestion task: {e}")
+    finally:
+        task_lock["ingestion"] = False
 
 def run_learning_task():
+    if task_lock["learning"]:
+        print("GUARDIAN: Learning task already running, skipping.")
+        return
+    
+    task_lock["learning"] = True
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running baseline learning at {time.strftime('%H:%M:%S')}...")
     try:
         update_baseline()
         print("GUARDIAN: Baseline learning task completed.")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e):
+            print("GUARDIAN: Database temporarily locked, will retry later.")
+        else:
+            print(f"GUARDIAN: Database error during learning: {e}")
     except Exception as e:  
         print(f"GUARDIAN: ERROR during learning task: {e}")
+    finally:
+        task_lock["learning"] = False
 
 def run_scanner_task():
-    """A separate, scheduled task for the slow VirusTotal scanner."""
+    if task_lock["scanner"]:
+        print("GUARDIAN: Scanner task already running, skipping this cycle.")
+        return
+    
+    task_lock["scanner"] = True
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running threat scanner at {time.strftime('%H:%M:%S')}...")
     try:
-        # The scanner now handles its own connection and logic.
         scan_unscanned_files()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e):
+            print("GUARDIAN: Database temporarily locked, will retry next cycle.")
+        else:
+            print(f"GUARDIAN: Database error during scanning: {e}")
     except Exception as e:
         print(f"GUARDIAN: ERROR during scanner task: {e}")
+    finally:
+        task_lock["scanner"] = False
 
 def run_analysis_once():
-    """
-    Scans all unprocessed events in the database ONE TIME, scores them,
-    and persists any detected narratives.
-    """
+    """Scans all unprocessed events in the database ONE TIME."""
     logger.info("--- Kicking off single analysis run ---")
     
     try:
         with dao.get_db_connection() as conn:
             cursor = conn.cursor()
             
-            # This is the same logic from the Guardian's loop
             query = "SELECT e.*, f.name, f.mime_type FROM events e LEFT JOIN files f ON e.file_id = f.id WHERE e.is_analyzed = 0 ORDER BY e.ts ASC"
             unprocessed_events = cursor.execute(query).fetchall()
 
@@ -64,20 +99,18 @@ def run_analysis_once():
                     event_dict = dict(event_row)
                     event_id = event_dict['id']
                     
-                    # Call the main orchestrator
-                    result = get_final_threat_score(event_dict)
-
-                    # Mark the event as analyzed
+                    # CRITICAL FIX: Mark as analyzed FIRST and commit
                     dao.update_event_analysis_status(cursor, event_id, 1)
+                    conn.commit()
+                    
+                    # NOW score the event (which may save a narrative in a separate connection)
+                    result = get_final_threat_score(event_dict)
 
                     if result['threat_level'] in ['High', 'Critical']:
                         logger.warning(f"High threat event detected! ID: {event_id}, Score: {result['final_score']:.2f}")
                         if result.get('narrative_info'):
                             logger.critical(f"*** NARRATIVE DETECTED AND SAVED: {result['narrative_info']['narrative_type']} ***")
-                        # You can re-enable notifications here if you want
-                        # send_notification(f"{result['threat_level']} Threat Detected!", f"Score: {result['final_score']:.0f}")
 
-                conn.commit()
                 logger.info("Analysis run complete. All changes committed.")
             else:
                 logger.info("No new events to analyze.")
@@ -87,58 +120,65 @@ def run_analysis_once():
         logger.error(f"ERROR during analysis run: {e}")
         traceback.print_exc()
 
-# --- END OF NEW FUNCTION ---
-
 def run_analysis_tasks():
-    """
-    This task is now lean and focused ONLY on scoring new events.
-    """
+    if task_lock["analysis"]:
+        print("GUARDIAN: Analysis task already running, skipping this cycle.")
+        return
+    
+    task_lock["analysis"] = True
     print(f"\nGUARDIAN: [SCHEDULED TASK] Running analysis suite at {time.strftime('%H:%M:%S')}...")
     try:
         with dao.get_db_connection() as conn:
             print("GUARDIAN: Analyzing new, unprocessed events...")
             cursor = conn.cursor()
-            query = "SELECT e.*, f.name, f.mime_type, f.is_shared_externally, f.vt_positives, f.created_time, f.modified_time, ub.typical_activity_hours_json FROM events e LEFT JOIN files f ON e.file_id = f.id LEFT JOIN user_baseline ub ON e.actor_user_id = ub.user_id WHERE e.is_analyzed = 0"
+            query = "SELECT e.*, f.name, f.mime_type FROM events e LEFT JOIN files f ON e.file_id = f.id WHERE e.is_analyzed = 0"
             cursor.execute(query)
             unprocessed_events = cursor.fetchall()
+            
             if unprocessed_events:
                 print(f"GUARDIAN: Found {len(unprocessed_events)} new events to analyze.")
                 for event in unprocessed_events:
                     event_dict = dict(event)
                     event_id = event_dict['id']
-                    result = get_final_threat_score(event_dict)
+                    
+                    # CRITICAL FIX: Mark as analyzed and commit BEFORE scoring
                     dao.update_event_analysis_status(cursor, event_id, 1)
+                    conn.commit()
+                    
+                    # NOW score (may open separate connection for narrative)
+                    result = get_final_threat_score(event_dict)
 
-                    # --- >>> FIX IS HERE: Robust notification logic <<< ---
                     if result['threat_level'] in ['High', 'Critical']:
                         logic_tier = result['breakdown']['logic_tier']
                         primary_reason = "No specific reason found."
 
-                        # Prioritize the narrative reason if it's the driver
                         if logic_tier == "Narrative-Driven":
                             reasons_list = result['breakdown']['nr_details']['reasons']
                             if reasons_list:
                                 primary_reason = reasons_list[0]
-                        # Otherwise, use the event-driven reason
                         else:
                             reasons_list = result['breakdown']['er_details']['reasons']
                             if reasons_list:
-                                # The last reason added is often the most significant
                                 primary_reason = reasons_list[-1]
                         
                         title = f"{result['threat_level']} Threat Detected ({logic_tier})"
                         message = f"Score: {result['final_score']:.0f}/100. Reason: {primary_reason}"
                         send_notification(title, message)
-                
-                conn.commit()
             else:
                 print("GUARDIAN: No new events to analyze.")
         
         print("GUARDIAN: Analysis suite completed.")
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e):
+            print("GUARDIAN: Database temporarily locked, will retry next cycle.")
+        else:
+            print(f"GUARDIAN: Database error during analysis: {e}")
     except Exception as e:
         import traceback
         print(f"GUARDIAN: ERROR during analysis task: {e}")
         traceback.print_exc()
+    finally:
+        task_lock["analysis"] = False
 
 def send_notification(title, message):
     print(f"GUARDIAN: Sending notification: '{title}'")
@@ -168,15 +208,14 @@ scheduler = BackgroundScheduler()
 def start_guardian_service():
     print("GUARDIAN: Starting Argus Guardian Service...")
     
-    scheduler.add_job(run_ingestion_task, 'interval', minutes=1, id='ingestion_job')
-    scheduler.add_job(run_analysis_tasks, 'interval', minutes=1, id='analysis_job')
-    scheduler.add_job(run_scanner_task, 'interval', minutes=1, id='scanner_job')
+    # FIXED: Stagger the tasks to prevent simultaneous database access
+    scheduler.add_job(run_ingestion_task, 'interval', minutes=2, id='ingestion_job')
+    scheduler.add_job(run_analysis_tasks, 'interval', minutes=2, id='analysis_job', next_run_time=datetime.now())
+    scheduler.add_job(run_scanner_task, 'interval', minutes=5, id='scanner_job')
     scheduler.add_job(run_learning_task, 'cron', hour=2, id='learning_job')
     
     print("GUARDIAN: All jobs scheduled. Running initial tasks now...")
     scheduler.add_job(run_ingestion_task, 'date', run_date=datetime.now())
-    scheduler.add_job(run_learning_task, 'date', run_date=datetime.now())
-    scheduler.add_job(run_scanner_task, 'date', run_date=datetime.now())
     
     scheduler.start()
     print("GUARDIAN: Scheduler started. Service is now fully operational.")
